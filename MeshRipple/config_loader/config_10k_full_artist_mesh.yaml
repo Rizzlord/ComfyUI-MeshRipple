@@ -1,0 +1,54 @@
+project_name: "artist_mesh"
+output_folder_base: "./generate_res_10k/"
+data:
+  eval_dataset_path: "./demo_data/demo"
+  num_workers: 2
+
+data_processing:
+  overfit: false 
+  dec_to_facenum: -1
+  y_up: true
+  n_discrete_size: 128
+  vertex_order: "zyx"
+  max_len: 10000
+  min_len: 500
+  pc_num: 16384
+  total_pc_num: 40960
+  windowing:
+    window_size: 1000
+    window_stride: 500
+    split_method: "sliding_window" 
+  val_augmentation:
+    shift_augment: false
+    scale_augment: false
+    dec_augment: false
+    rot_augment: false
+    sample_augment: false
+model:
+  # model_path: "./ckpt/meshRipple_nsa.pth"
+  model_path: "./ckpt/meshRipple_10k.pth"
+  # model_version: "v1-nsa"
+  model_version: "full_attn"
+  feature_dim: 768
+  num_heads: 12
+  root_pred_depth: 3
+  context_embedding_dim: 256
+  num_classify: 100
+  hourglass_depth: [4, 4, 9] # [4, 4, 3*3]
+  conditioned_on_pc: true
+  encoder_freeze: false
+
+training:
+  batch_size: 4
+  root_embed: false
+
+accelerator:
+  mixed_precision: "bf16" # "no", "fp16", "bf16"
+
+generate:
+  batch_size: 4
+  top_k: 50
+  top_p: 0.95
+  temperature: 0.9
+  eos_aug: False
+  wr_fix: False

@@ -1,0 +1,10 @@
+numpy 
+transformers 
+omegaconf 
+einops 
+beartype
+accelerate
+trimesh
+open3d
+timm
+scikit-image
