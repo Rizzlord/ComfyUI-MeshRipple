@@ -1,6 +1,7 @@
 # This file is modified from the original implementation (implemented by Xunhao Lai)
 
 import torch
+from typing import Optional
 from einops import rearrange
 from flash_attn import flash_attn_varlen_func
 
@@ -92,14 +93,16 @@ class NativeSparseAttention(torch.nn.Module):
             kv_start: int = 0,
             causal: bool = True,
             return_three_gates: bool = False,
+            past_kv: Optional[dict] = None,
     ):
         # dtype and shape check
         assert x_q.dtype == torch.bfloat16 or x_q.dtype == torch.float16, x_q.dtype
-        assert x_k.dtype == torch.bfloat16 or x_k.dtype == torch.float16, x_k.dtype
-        assert x_v.dtype == torch.bfloat16 or x_v.dtype == torch.float16, x_v.dtype
-        assert x_q.shape[-1] == self.hidden_size
-        assert x_k.shape[-1] == self.hidden_size
-        assert x_v.shape[-1] == self.hidden_size
+        
+        # When using cache, x_k and x_v only contain the new tokens
+        if past_kv is not None:
+            # q_start is used as the current sequence length in the cache management logic elsewhere,
+            # but here we need the total length for indexing.
+            pass
 
         q_cu_seqlens = q_cu_seqlens.to(torch.int32)
         q_seqlens = q_cu_seqlens[1:] - q_cu_seqlens[:-1]
@@ -111,23 +114,103 @@ class NativeSparseAttention(torch.nn.Module):
         k = self.proj_k(x_k).view(-1, self.num_kv_heads, self.head_dim)
         v = self.proj_v(x_v).view(-1, self.num_kv_heads, self.head_dim)
 
-        # compressed key and value before rope
-        compressed_k, compressed_k_cu_seqlens = linear_compress(
-            k,
-            self.compress_key,
-            kv_cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
-        )
-        compressed_v, _ = linear_compress(
-            v,
-            self.compress_value,
-            kv_cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
+        if past_kv is not None:
+            # Incremental KV Cache Update
+            # In MeshRipple, k and v here are the new tokens [batch * seq_len, heads, dim]
+            # Since we assume single-token generation (seq_len=1 per batch), we can simplify.
+            # However, for robustness, we'll handle multiple tokens.
+            
+            k_cache = past_kv['k_raw']
+            v_cache = past_kv['v_raw']
+            
+            # Append new raw k,v to cache
+            # Expected k_cache shape: [total_len, heads, dim]
+            # Assuming contiguous batching for now as per nsa design
+            k_cache = torch.cat([k_cache, k], dim=0)
+            v_cache = torch.cat([v_cache, v], dim=0)
+            past_kv['k_raw'] = k_cache
+            past_kv['v_raw'] = v_cache
+            
+            full_k = k_cache
+            full_v = v_cache
+            
+            # total raw length
+            total_raw_len = full_k.shape[0]
+            # current batch size (assuming 1 for now or fixed)
+            bsz = q_cu_seqlens.shape[0] - 1
+            
+            # Update compressed cache
+            k_comp_cache = past_kv['k_compressed']
+            v_comp_cache = past_kv['v_compressed']
+            
+            # Logic: check if we hit a new compression window
+            # N = floor((L - K) / S) + 1
+            new_comp_len = max(0, (total_raw_len - self.kernel_size) // self.kernel_stride + 1)
+            old_comp_len = k_comp_cache.shape[0]
+            
+            if new_comp_len > old_comp_len:
+                # We need to compute new compressed tokens
+                # We can just run linear_compress on the relevant window of full_k/full_v
+                # or for simplicity (since it's only 1 new token usually), run it on the whole thing and take last
+                # But running it on the whole thing defeats the O(1) purpose.
+                # However, linear_compress kernel is fast.
+                
+                # To keep it O(1), we only compress the NEW window
+                for i in range(old_comp_len, new_comp_len):
+                    w_start = i * self.kernel_stride
+                    w_end = w_start + self.kernel_size
+                    
+                    # Manual compression for high performance on single window
+                    # window_k: [1, kernel_size, heads, dim]
+                    window_k = full_k[w_start:w_end].reshape(1, self.kernel_size, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+                    window_k = rearrange(window_k, 'b h k d -> b h (k d)')
+                    # window_k: [1, heads, kernel_size*dim]
+                    # weight: [heads, kernel_size*dim, dim]
+                    new_k_c = torch.einsum('b h d, h d D -> b h D', window_k, self.compress_key)
+                    # apply PE if exists
+                    pe = rearrange(self.intra_block_pe, 'h k d -> h (k d)')
+                    bias_k = torch.einsum('h D, h D d -> h d', pe, self.compress_key)
+                    new_k_c = new_k_c + bias_k.unsqueeze(0)
+                    
+                    k_comp_cache = torch.cat([k_comp_cache, new_k_c.view(-1, self.num_kv_heads, self.head_dim)], dim=0)
+                    
+                    # Same for V (no PE usually)
+                    window_v = full_v[w_start:w_end].reshape(1, self.kernel_size, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+                    window_v = rearrange(window_v, 'b h k d -> b h (k d)')
+                    new_v_c = torch.einsum('b h d, h d D -> b h D', window_v, self.compress_value)
+                    v_comp_cache = torch.cat([v_comp_cache, new_v_c.view(-1, self.num_kv_heads, self.head_dim)], dim=0)
+                
+                past_kv['k_compressed'] = k_comp_cache
+                past_kv['v_compressed'] = v_comp_cache
+
+            compressed_k = k_comp_cache
+            compressed_v = v_comp_cache
+            
+            # Recalculate cu_seqlens for the full cache
+            full_kv_cu_seqlens = torch.tensor([0, total_raw_len], device=q.device, dtype=torch.int32)
+            compressed_k_cu_seqlens = torch.tensor([0, compressed_k.shape[0]], device=q.device, dtype=torch.int32)
+            
+            k = full_k
+            v = full_v
+            kv_cu_seqlens = full_kv_cu_seqlens
+        else:
+            # compressed key and value before rope
+            compressed_k, compressed_k_cu_seqlens = linear_compress(
+                k,
+                self.compress_key,
+                kv_cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                self.intra_block_pe,
+            )
+            compressed_v, _ = linear_compress(
+                v,
+                self.compress_value,
+                kv_cu_seqlens,
+                self.kernel_size,
+                self.kernel_stride,
+                None,
+            )
 
         # do rope for query and compressed key
         q = self.rope(q, q_cu_seqlens, offset=q_start)

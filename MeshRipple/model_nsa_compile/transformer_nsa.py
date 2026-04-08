@@ -256,6 +256,11 @@ class MLCA(nn.Module):
             # kv not contains padding when causal=False
             kv, kv_cu_seqlens = self.get_attn_input(context, None)
         
+        # Use cache if enabled
+        nsa_past_kv = None
+        if use_cache and hasattr(self, 'nsa_cache'):
+            nsa_past_kv = self.nsa_cache
+
         attn_out = self.attn(
             q,
             kv,
@@ -265,6 +270,7 @@ class MLCA(nn.Module):
             q_start=start,
             kv_start=0,
             causal=causal,
+            past_kv=nsa_past_kv,
         )
         
         attn_out = self.attn_dropout(attn_out)
@@ -282,19 +288,17 @@ class MLCA(nn.Module):
 
     def init_kv_cache(self, batch_size, dtype=torch.bfloat16):
         """Initialize KV cache for this transformer block"""
-        # return self.attn.empty_kv_cache(
-        #     batch_size=batch_size, dtype=dtype
-        # )
-
-        # todo: nsa-kv-cache
+        self.nsa_cache = {
+            'k_raw': torch.zeros(0, self.attn.num_kv_heads, self.attn.head_dim, device=next(self.parameters()).device, dtype=dtype),
+            'v_raw': torch.zeros(0, self.attn.num_kv_heads, self.attn.head_dim, device=next(self.parameters()).device, dtype=dtype),
+            'k_compressed': torch.zeros(0, self.attn.num_kv_heads, self.attn.head_dim, device=next(self.parameters()).device, dtype=dtype),
+            'v_compressed': torch.zeros(0, self.attn.num_kv_heads, self.attn.head_dim, device=next(self.parameters()).device, dtype=dtype),
+        }
         return 0
 
     def reset_kv_cache(self):
         """Reset KV cache for this transformer block"""
-        # self.attn.reset_cache()
-
-        # todo: nsa-kv-cache
-        pass
+        self.nsa_cache = None
 
 
 class NSAFaceBoundary(nn.Module):
@@ -988,6 +992,7 @@ class NSAFaceBoundary(nn.Module):
         eos_aug = False,
         root_connect_constrain = True,
         wr_fix = True,
+        use_kv_cache = True,
     ):
         """
         Generate sequence using the same interface as the original generate_sequence function
@@ -1022,14 +1027,17 @@ class NSAFaceBoundary(nn.Module):
                 conds = self.conditioner(pc)
             else:
                 conds = None  
-            # First forward pass with the entire initial sequence
-            with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                output, class_next = self._process_first_tokens(
-                            generated, 
-                            generated_context, 
-                            generated_attention_mask, 
-                            start, 
-                            conds=conds)
+            if use_kv_cache:
+                # First forward pass with the entire initial sequence
+                with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+                    output, class_next = self._process_first_tokens(
+                                generated, 
+                                generated_context, 
+                                generated_attention_mask, 
+                                start, 
+                                conds=conds)
+            else:
+                output, class_next = self.forward(generated, generated_context, generated_attention_mask, None, start, conds=conds)
 
             start += generated.shape[1]
 
@@ -1159,29 +1167,32 @@ class NSAFaceBoundary(nn.Module):
                             generated_attention_mask[i, 0, cur_next_root_i:] = False
                     total_attention_mask[:, cur_unflatten_len:cur_unflatten_len+1, :generated_attention_mask.shape[2]] = generated_attention_mask
 
-                if self.cache_method=="sliding_window" and start[0]+1 >= 9000 and (start[0]+1-9000)%4500 == 0:
-                    start_pos = torch.full((generated.shape[0],), 4500 + ((start[0]+1 - 9000)//4500)*4500, device=device)
-                    with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                        output, class_next = self._process_muti_tokens(
-                                    generated[:, start_pos[0]:start[0]+1], 
-                                    generated_context, 
-                                    total_attention_mask[:,start_pos[0]//9:start[0]//9+1,start_pos[0]//9:start[0]//9+1], 
-                                    start_pos, 
-                                    conds=conds
-                        )
+                if use_kv_cache:
+                    if self.cache_method=="sliding_window" and start[0]+1 >= 9000 and (start[0]+1-9000)%4500 == 0:
+                        start_pos = torch.full((generated.shape[0],), 4500 + ((start[0]+1 - 9000)//4500)*4500, device=device)
+                        with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+                            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                                torch.compiler.cudagraph_mark_step_begin()
+                            output, class_next = self._process_muti_tokens(
+                                        generated[:, start_pos[0]:start[0]+1], 
+                                        generated_context[:,-1:], 
+                                        total_attention_mask[:,start_pos[0]//9:start[0]//9+1,start_pos[0]//9:start[0]//9+1], 
+                                        start_pos, 
+                                        conds=conds
+                            )
 
+                    else:
+                        with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+                            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                                torch.compiler.cudagraph_mark_step_begin()
+                            output, class_next = self._process_single_token(
+                                        next_token, 
+                                        generated_context[:,-1:], 
+                                        generated_attention_mask[:,-1:], 
+                                        start, 
+                                        conds=conds)
                 else:
-                    with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                        output, class_next = self._process_single_token(
-                                    next_token, 
-                                    generated_context, 
-                                    generated_attention_mask[:,-1:], 
-                                    start, 
-                                    conds=conds)
+                    output, class_next = self.forward(generated, generated_context, total_attention_mask[:,:start[0]//9+1,:start[0]//9+1], None, torch.zeros_like(start), conds=conds)
 
                 start = start + 1
         # Reset cache after generation
@@ -1273,7 +1284,7 @@ class NSAFaceBoundary(nn.Module):
         all_cord = list(range(0, token_map['s'][0].item()))
 
         # If the root token is <n>, this is the first face of a new connected component, so restrict to coordinates only
-        if "root_token" in state and torch.equal(token_map["n"].flatten(), state["root_token"]):
+        if "root_token" in state and torch.equal(token_map["n"].flatten().to(state["root_token"].device), state["root_token"]):
             return all_cord
 
         # If state has not been initialized yet (for example, when generating the first token), allow any token

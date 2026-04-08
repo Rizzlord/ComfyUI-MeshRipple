@@ -959,7 +959,8 @@ class FaceBoundary(nn.Module):
         temperature: float = 0.9,
         eos_aug = False,
         root_connect_constrain = True,
-        wr_fix=True
+        wr_fix=True,
+        use_kv_cache=True
     ):
         """
         Generate sequence using the same interface as the original generate_sequence function
@@ -998,17 +999,19 @@ class FaceBoundary(nn.Module):
                 conds = self.conditioner(pc)
             else:
                 conds = None  
-            # First forward pass with the entire initial sequence
-            with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                    torch.compiler.cudagraph_mark_step_begin()
-                output, class_next = self._process_first_tokens(
-                            generated, 
-                            generated_context, 
-                            generated_attention_mask, 
-                            start, 
-                            conds=conds)
-            # output = self.forward(generated, generated_context, generated_attention_mask, None, start)
+            if use_kv_cache:
+                # First forward pass with the entire initial sequence
+                with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+                    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                        torch.compiler.cudagraph_mark_step_begin()
+                    output, class_next = self._process_first_tokens(
+                                generated, 
+                                generated_context, 
+                                generated_attention_mask, 
+                                start, 
+                                conds=conds)
+            else:
+                output, class_next = self.forward(generated, generated_context, generated_attention_mask, None, start, conds=conds)
             start += generated.shape[1]
             # Then generate one token at a time
             generate_tqdm = tqdm(
@@ -1122,29 +1125,32 @@ class FaceBoundary(nn.Module):
                             generated_attention_mask[i, 0, cur_next_root_i:] = False
                     total_attention_mask[:, cur_unflatten_len:cur_unflatten_len+1, :generated_attention_mask.shape[2]] = generated_attention_mask
                     
-                if self.cache_method=="sliding_window" and start[0]+1 >= 9000 and (start[0]+1-9000)%4500 == 0:
-                    start_pos_sliding = torch.full((batch_size,), 4500 + ((start[0] + 1 - 9000)//4500)*4500, dtype=torch.long, device=device)
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                        output, class_next = self._process_muti_tokens(
-                                    generated[:, start_pos_sliding[0]:start[0]+1], 
-                                    generated_context[:,-1:], 
-                                    total_attention_mask[:,start_pos_sliding[0]//9:start[0]//9+1,start_pos_sliding[0]//9:start[0]//9+1], 
-                                    start_pos_sliding, 
-                                    conds=conds
-                        )
-                        
+                if use_kv_cache:
+                    if self.cache_method=="sliding_window" and start[0]+1 >= 9000 and (start[0]+1-9000)%4500 == 0:
+                        start_pos_sliding = torch.full((batch_size,), 4500 + ((start[0] + 1 - 9000)//4500)*4500, dtype=torch.long, device=device)
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                                torch.compiler.cudagraph_mark_step_begin()
+                            output, class_next = self._process_muti_tokens(
+                                        generated[:, start_pos_sliding[0]:start[0]+1], 
+                                        generated_context[:,-1:], 
+                                        total_attention_mask[:,start_pos_sliding[0]//9:start[0]//9+1,start_pos_sliding[0]//9:start[0]//9+1], 
+                                        start_pos_sliding, 
+                                        conds=conds
+                            )
+                            
+                    else:
+                        with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+                            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                                torch.compiler.cudagraph_mark_step_begin()
+                            output, class_next = self._process_single_token(
+                                        next_token, 
+                                        generated_context[:,-1:], 
+                                        generated_attention_mask[:,-1:], 
+                                        start, 
+                                        conds=conds)
                 else:
-                    with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                        output, class_next = self._process_single_token(
-                                    next_token, 
-                                    generated_context[:,-1:], 
-                                    generated_attention_mask[:,-1:], 
-                                    start, 
-                                    conds=conds)
+                    output, class_next = self.forward(generated, generated_context, total_attention_mask[:,:start[0]//9+1,:start[0]//9+1], None, torch.zeros_like(start), conds=conds)
             
                 start = start + 1
         # Reset cache after generation
@@ -1238,7 +1244,7 @@ class FaceBoundary(nn.Module):
         all_cord = list(range(0, token_map['s'][0].item()))
 
         # If the root token is <n>, this is the first face of a new connected component, so restrict to coordinates only
-        if "root_token" in state and torch.equal(token_map["n"].flatten(), state["root_token"]):
+        if "root_token" in state and torch.equal(token_map["n"].flatten().to(state["root_token"].device), state["root_token"]):
             return all_cord
 
         # If state has not been initialized yet (for example, when generating the first token), allow any token

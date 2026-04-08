@@ -197,6 +197,7 @@ class MeshRippleModelLoader:
         return {
             "required": {
                 "model_name": (["meshRipple_10k.pth", "meshRipple_nsa.pth"],),
+                "compile_model": ("BOOLEAN", {"default": False}),
             }
         }
     
@@ -204,7 +205,7 @@ class MeshRippleModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "MeshRipple"
 
-    def load_model(self, model_name):
+    def load_model(self, model_name, compile_model):
         ckpt_path = os.path.join("/Apps/ComfyUI/models/meshripple/", model_name)
         
         if "10k" in model_name:
@@ -274,6 +275,10 @@ class MeshRippleModelLoader:
         model.load_state_dict(state_dict, strict=False)
         model.to(device).eval()
         
+        if compile_model:
+            print(f"Compiling MeshRipple math kernels...")
+            model.compile_math_kernels()
+        
         return ({"model": model, "config": config, "token_map": token_map, "device": device},)
 
 class MeshRippleGenerator:
@@ -288,6 +293,7 @@ class MeshRippleGenerator:
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0}),
                 "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0}),
                 "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000}),
+                "use_kv_cache": ("BOOLEAN", {"default": True}),
             }
         }
     
@@ -295,7 +301,7 @@ class MeshRippleGenerator:
     FUNCTION = "generate_mesh"
     CATEGORY = "MeshRipple"
 
-    def generate_mesh(self, mesh_ripple_model, points, seed, top_k, top_p, temperature, max_faces):
+    def generate_mesh(self, mesh_ripple_model, points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
         # Prepare points
         # If points is (B, N, 3/6), take first batch
         if points.ndim == 3:
@@ -317,7 +323,7 @@ class MeshRippleGenerator:
         norm_points[:, :3] = (points[:, :3] - p_center) / p_scale
         norm_points[:, :3] = norm_points[:, :3].clamp(-0.5, 0.5)
         
-        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces)
+        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
 
 class MeshRippleRemesh:
     @classmethod
@@ -332,6 +338,7 @@ class MeshRippleRemesh:
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0}),
                 "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0}),
                 "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000}),
+                "use_kv_cache": ("BOOLEAN", {"default": True}),
             }
         }
     
@@ -339,7 +346,7 @@ class MeshRippleRemesh:
     FUNCTION = "remesh"
     CATEGORY = "MeshRipple"
 
-    def remesh(self, mesh_ripple_model, mesh, sample_points, seed, top_k, top_p, temperature, max_faces):
+    def remesh(self, mesh_ripple_model, mesh, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
         # Convert input to trimesh
         # Handle dictionary format (ComfyUI standard)
         if isinstance(mesh, dict) and "vertices" in mesh and "faces" in mesh:
@@ -382,9 +389,9 @@ class MeshRippleRemesh:
         norm_points_tensor[:, :3] = (norm_points_tensor[:, :3] - p_center) / p_scale
         norm_points_tensor[:, :3] = norm_points_tensor[:, :3].clamp(-0.5, 0.5)
         
-        return common_generate(mesh_ripple_model, norm_points_tensor, seed, top_k, top_p, temperature, max_faces)
+        return common_generate(mesh_ripple_model, norm_points_tensor, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
 
-def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces):
+def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
     model = mesh_ripple_model["model"]
     config = mesh_ripple_model["config"]
     token_map = mesh_ripple_model["token_map"]
@@ -447,6 +454,7 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
                 eos_aug=config.generate.eos_aug,
                 wr_fix=config.generate.wr_fix,
                 root_connect_constrain=True,
+                use_kv_cache=use_kv_cache
             )
         else:
             call_kwargs = dict(
@@ -467,6 +475,7 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
                 eos_aug=config.generate.eos_aug,
                 wr_fix=config.generate.wr_fix,
                 root_connect_constrain=True,
+                use_kv_cache=use_kv_cache
             )
         
         total_pred_token = model.generate(**call_kwargs)
@@ -474,12 +483,14 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     pred_token = total_pred_token[:, 9:]
     pred_token_unflatten = pred_token.view(pred_token.shape[0], -1, 9)
     
-    # Token processing logic
-    eos_id = token_map["eos"]
-    pad_id = token_map["pad"]
+    # Token processing logic - ensure all on CPU for processing
+    eos_id = token_map["eos"].cpu()
+    pad_id = token_map["pad"].cpu()
     
-    eos_mask = torch.eq(pred_token_unflatten.to(device), eos_id.to(device)).any(dim=2)
-    pad_mask = torch.eq(pred_token_unflatten, pad_id.to(device)).any(dim=2)
+    # Process on CPU to avoid device mismatch with the IDs from token_map
+    pred_token_unflatten_cpu = pred_token_unflatten.detach().cpu()
+    eos_mask = torch.eq(pred_token_unflatten_cpu, eos_id).any(dim=2)
+    pad_mask = torch.eq(pred_token_unflatten_cpu, pad_id).any(dim=2)
     stop_mask = eos_mask | pad_mask
     
     stop_indices = stop_mask.float().argmax(dim=1)
@@ -489,8 +500,9 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     lenth = stop_indices[0].item()
     tokens = pred_token_unflatten[0, :lenth]
     
-    identifiers = torch.stack(list(token_map.values())).to(device)
-    valid_mask = ~(tokens.unsqueeze(1) == identifiers).all(dim=2).any(dim=1)
+    # Use CPU for identifier comparison
+    identifiers = torch.stack([v.detach().cpu() for v in token_map.values()])
+    valid_mask = ~(tokens.unsqueeze(1).cpu() == identifiers).all(dim=2).any(dim=1)
     valid_indices = torch.where(valid_mask)[0]
     vertices_faces = tokens[valid_indices]
     
