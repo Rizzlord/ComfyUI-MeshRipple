@@ -139,17 +139,22 @@ class Img2PointT2:
             "required": {
                 "image": ("IMAGE",),
                 "seed": ("INT", {"default": 1337, "min": 0, "max": 0x7fffffff}),
-                "sparse_structure_resolution": ("INT", {"default": 32, "min": 32, "max": 128, "step": 4}),
-                "cascade_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 128}),
+                "shape_resolution": ([512, 1024], {"default": 512}),
+                "cascade_resolution": ([512, 1024, 1536, 2048, 2560, 3072, 3584, 4096], {"default": 1024}),
                 "reconstruct_with_quad": ("BOOLEAN", {"default": True}),
+                "remesh_resolution": ([128, 256, 512, 1024, 2048], {"default": 512}),
+                "simplification_method": (["none", "cumesh", "meshlib"], {"default": "none"}),
+                "simplification_target": ("INT", {"default": 50000, "min": 1000, "max": 1000000, "step": 1000}),
+                "fill_holes_with_meshlib": ("BOOLEAN", {"default": True}),
             }
         }
 
-    RETURN_TYPES = ("POINTS",)
+    RETURN_TYPES = ("POINTS", "TRIMESH",)
+    RETURN_NAMES = ("points", "trimesh",)
     FUNCTION = "generate"
     CATEGORY = "MeshRipple"
 
-    def generate(self, image, seed, sparse_structure_resolution, cascade_resolution, reconstruct_with_quad):
+    def generate(self, image, seed, shape_resolution, cascade_resolution, reconstruct_with_quad, remesh_resolution, simplification_method, simplification_target, fill_holes_with_meshlib):
         T2Pipeline, T2MeshWithVoxel = import_trellis2()
         if not T2Pipeline:
             raise Exception("Trellis2 not found. Please install trellis2 comfyui nodes.")
@@ -179,78 +184,182 @@ class Img2PointT2:
             "rescale_t": 4.0
         }
 
+        # Resolve Trellis2 internals
+        from trellis2.pipelines.trellis2_image_to_3d import seed_all
+        seed_all(seed)
+        
+        # Convert IMAGE tensor (B, H, W, C) to PIL List
+        # ComfyUI: [batch_index, h, w, c]
+        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        pil_images = [Image.fromarray(img_np)]
+        image_in = pil_images[0] if len(pil_images) == 1 else pil_images
+
+        # Progress Setup
         from comfy.utils import ProgressBar
-        pbar = ProgressBar(10) # Cascade has roughly 10 major steps
+        pbar = ProgressBar(6)
 
-        print(f"Running Trellis2 cascade for points (Seed: {seed})...")
-        outputs = pipeline.run_cascade(
-            image=pil_img,
-            seed=seed,
-            sparse_structure_sampler_params=sampler_params,
-            low_res_shape_slat_sampler_params=sampler_params,
-            high_res_shape_slat_sampler_params=sampler_params,
-            generate_texture_slat=False, # We only need points
-            use_tiled=True,
-            max_num_tokens=999999,
-            sparse_structure_resolution=sparse_structure_resolution,
-            cascade_resolution=cascade_resolution, # Added
+        print(f"Executing manual Trellis2 pipeline (Shape: {shape_resolution}, Cascade: {cascade_resolution}, Seed: {seed})...")
+        
+        # 1. Image Conditioning
+        pipeline.load_image_cond_model()
+        cond_512 = pipeline.get_cond(pil_images, 512, max_views=4)
+        cond_target = pipeline.get_cond(pil_images, shape_resolution, max_views=4) if shape_resolution != 512 else cond_512
+        pbar.update(1)
+        if not pipeline.keep_models_loaded: pipeline.unload_image_cond_model()
+
+        # 2. Sparse Structure
+        pipeline.load_sparse_structure_model()
+        coords = pipeline.sample_sparse_structure(
+            cond_512, 32, # sparse_structure_resolution default
+            1, sampler_params,
             fill_holes=True,
-            keep_only_shell=True,
-            pbar=pbar # Fix: Provide pbar
+            keep_only_shell=True
         )
+        pbar.update(1)
+        if not pipeline.keep_models_loaded: pipeline.unload_sparse_structure_model()
 
-        mesh = outputs[0] # MeshWithVoxel
+        # 3. Shape Slat Cascade
+        pipeline.load_shape_slat_flow_model_512()
+        pipeline.load_shape_slat_flow_model_1024()
+        
+        # Use advanced cascade sampler to support requested resolutions
+        if cascade_resolution == 512 and shape_resolution == 512:
+            # Single stage 512
+            from trellis2.modules.sparse.basic import SparseTensor
+            noise = SparseTensor(
+                feats=torch.randn(coords.shape[0], pipeline.models['shape_slat_flow_model_512'].in_channels, device=device),
+                coords=coords.to(device)
+            )
+            shape_slat = pipeline.shape_slat_sampler.sample(
+                pipeline.models['shape_slat_flow_model_512'], noise, **cond_512, **sampler_params
+            ).samples
+            res = 512
+        else:
+            # Multi-stage cascade
+            shape_slat, res = pipeline.sample_shape_slat_cascade_advanced(
+                cond_512, cond_target,
+                pipeline.models['shape_slat_flow_model_512'], 
+                pipeline.models['shape_slat_flow_model_1024'],
+                512, cascade_resolution,
+                coords, sampler_params, sampler_params
+            )
+        pbar.update(1)
+        
+        if not pipeline.keep_models_loaded:
+            pipeline.unload_shape_slat_flow_model_512()
+            pipeline.unload_shape_slat_flow_model_1024()
+
+        # 4. Decode
+        torch.cuda.empty_cache()
+        meshes = pipeline.decode_latent(shape_slat, None, res, use_tiled=True)
+        mesh = meshes[0]
+        pbar.update(1)
         
         # Optional Quad Remesh
         if reconstruct_with_quad:
             import cumesh
-            print(f"Reconstructing mesh with quad (Resolution: {cascade_resolution})...")
+            print(f"Reconstructing mesh with quad (Resolution: {remesh_resolution})...")
             # DC Quad remeshing builds better topology for point sampling
             new_verts, new_faces = cumesh.remeshing.reconstruct_mesh_dc_quad(
                 mesh.vertices.cuda(), 
                 mesh.faces.cuda(), 
-                cascade_resolution, 
+                remesh_resolution, 
                 verbose=True
             )
             mesh.vertices = new_verts.cpu()
             mesh.faces = new_faces.cpu()
         
-        # Sample points from the mesh
-        # MeshWithVoxel has .vertices and .faces as tensors
-        verts = mesh.vertices.to(device)
-        faces = mesh.faces.to(device)
+        # 5. Advanced Post-Processing
+        # Optional Hole Filling (Meshlib)
+        if fill_holes_with_meshlib:
+            try:
+                import meshlib.mrmeshnumpy as mrmeshnumpy
+                import meshlib.mrmeshpy as mrmeshpy
+                import copy
+                import gc
+                
+                print("Filling holes with Meshlib...")
+                mr_mesh = mrmeshnumpy.meshFromFacesVerts(mesh.faces.cpu().numpy(), mesh.vertices.cpu().numpy())
+                hole_edges = mr_mesh.topology.findHoleRepresentiveEdges()
+                if len(hole_edges) > 0:
+                    for e in hole_edges:
+                        params = mrmeshpy.FillHoleParams()
+                        params.metric = mrmeshpy.getUniversalMetric(mr_mesh)
+                        mrmeshpy.fillHole(mr_mesh, e, params)
+                    
+                    new_vertices = mrmeshnumpy.getNumpyVerts(mr_mesh)
+                    new_faces = mrmeshnumpy.getNumpyFaces(mr_mesh.topology)
+                    mesh.vertices = torch.from_numpy(new_vertices).float().to(mesh.device)
+                    mesh.faces = torch.from_numpy(new_faces).int().to(mesh.device)
+                
+                del mr_mesh
+                gc.collect()
+            except ImportError:
+                print("Meshlib not found, skipping hole filling.")
+
+        # Optional Simplification
+        if simplification_method == "cumesh":
+            print(f"Simplifying mesh with Cumesh (Target: {simplification_target})...")
+            mesh.simplify_with_cumesh(target=simplification_target)
+        elif simplification_method == "meshlib":
+            try:
+                print(f"Simplifying mesh with Meshlib (Target: {simplification_target})...")
+                mesh.simplify_with_meshlib(target=simplification_target)
+            except ImportError:
+                print("Meshlib not found, skipping simplification.")
+
+        pbar.update(1)
+
+        # 6. Sample Points from FINAL PROCESSED mesh
+        import trimesh
+        # Use trimesh for sampling as it's more robust on decimated/cleaned meshes
+        tm = trimesh.Trimesh(vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy())
         
-        # Simple uniform sampling on faces
-        # 1. Compute face areas
-        v0 = verts[faces[:, 0]]
-        v1 = verts[faces[:, 1]]
-        v2 = verts[faces[:, 2]]
-        areas = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
+        N = 16384
+        print(f"Sampling {N} points from final processed mesh...")
+        # Use simple barycentric sampling on trimesh
+        points, face_indices = trimesh.sample.sample_surface(tm, N)
+        sampled_normals = tm.face_normals[face_indices]
         
-        num_points = 16384
-        # 2. Sample face indices based on area
-        face_indices = torch.multinomial(areas, num_points, replacement=True)
+        points_tensor = torch.from_numpy(points).float()
+        normals_tensor = torch.from_numpy(sampled_normals).float()
+
+        # Combine to (N, 6)
+        pc_normal = torch.cat([points_tensor, normals_tensor], dim=1) # (N, 6)
+        pbar.update(1)
         
-        # 3. Sample barycentric coordinates
-        r1 = torch.sqrt(torch.rand(num_points, device=device))
-        r2 = torch.rand(num_points, device=device)
-        u = 1 - r1
-        v = r1 * (1 - r2)
-        w = r1 * r2
+        return (pc_normal.unsqueeze(0), tm)
+
+class TrimeshToPoints:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+            }
+        }
+
+    RETURN_TYPES = ("POINTS",)
+    RETURN_NAMES = ("points",)
+    FUNCTION = "sample"
+    CATEGORY = "MeshRipple"
+
+    def sample(self, trimesh):
+        import trimesh as tm_module
+        import torch
+
+        N = 16384
+        print(f"Sampling {N} points from Trimesh for MeshRipple...")
         
-        # 4. Interpolate points
-        p0 = verts[faces[face_indices, 0]]
-        p1 = verts[faces[face_indices, 1]]
-        p2 = verts[faces[face_indices, 2]]
-        points = u.unsqueeze(1) * p0 + v.unsqueeze(1) * p1 + w.unsqueeze(1) * p2
+        # Consistent sampling logic using tm_module to avoid shadowing
+        points, face_indices = tm_module.sample.sample_surface(trimesh, N)
+        sampled_normals = trimesh.face_normals[face_indices]
         
-        # 5. Compute Normals (per face)
-        normals = torch.cross(v1 - v0, v2 - v0, dim=1)
-        normals = torch.nn.functional.normalize(normals, dim=1)
-        sampled_normals = normals[face_indices]
-        
-        # 6. Combine to (N, 6)
-        pc_normal = torch.cat([points, sampled_normals], dim=1) # (N, 6)
+        points_tensor = torch.from_numpy(points).float()
+        normals_tensor = torch.from_numpy(sampled_normals).float()
+
+        # Combine to (N, 6)
+        pc_normal = torch.cat([points_tensor, normals_tensor], dim=1) # (N, 6)
         
         return (pc_normal.unsqueeze(0),) # (1, N, 6)
 
@@ -698,6 +807,7 @@ NODE_CLASS_MAPPINGS = {
     "MichelangeloModelLoader": MichelangeloModelLoader,
     "MichelangeloImageToPoints": MichelangeloImageToPoints,
     "Img2PointT2": Img2PointT2,
+    "TrimeshToPoints": TrimeshToPoints,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -707,4 +817,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MichelangeloModelLoader": "Michelangelo Model Loader",
     "MichelangeloImageToPoints": "Michelangelo Image to Points",
     "Img2PointT2": "Trellis2 Image to Points",
+    "TrimeshToPoints": "Trimesh to Points (16k)",
 }
