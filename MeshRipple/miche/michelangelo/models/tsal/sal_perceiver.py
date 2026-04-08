@@ -6,10 +6,10 @@ from typing import Optional
 from einops import repeat
 import math
 
-from miche.michelangelo.models.modules import checkpoint
-from miche.michelangelo.models.modules.embedder import FourierEmbedder
-from miche.michelangelo.models.modules.distributions import DiagonalGaussianDistribution
-from miche.michelangelo.models.modules.transformer_blocks import (
+from michelangelo.models.modules import checkpoint
+from michelangelo.models.modules.embedder import FourierEmbedder
+from michelangelo.models.modules.distributions import DiagonalGaussianDistribution
+from michelangelo.models.modules.transformer_blocks import (
     ResidualCrossAttentionBlock,
     Transformer
 )
@@ -72,10 +72,15 @@ class CrossAttentionEncoder(nn.Module):
             self.ln_post = None
 
     def _forward(self, pc, feats):
+        """
 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, C]
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
+
+        Returns:
+
+        """
 
         bs = pc.shape[0]
 
@@ -94,11 +99,15 @@ class CrossAttentionEncoder(nn.Module):
         return latents, pc
 
     def forward(self, pc: torch.FloatTensor, feats: Optional[torch.FloatTensor] = None):
+        """
 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, C]
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
 
+        Returns:
+            dict
+        """
 
         return checkpoint(self._forward, (pc, feats), self.parameters(), self.use_checkpoint)
 
@@ -234,18 +243,18 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
                pc: torch.FloatTensor,
                feats: Optional[torch.FloatTensor] = None,
                sample_posterior: bool = True):
+        """
 
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
+            sample_posterior (bool):
 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, C]
-        #     sample_posterior (bool):
-
-        # Returns:
-        #     latents (torch.FloatTensor)
-        #     center_pos (torch.FloatTensor or None):
-        #     posterior (DiagonalGaussianDistribution or None):
-
+        Returns:
+            latents (torch.FloatTensor)
+            center_pos (torch.FloatTensor or None):
+            posterior (DiagonalGaussianDistribution or None):
+        """
 
         latents, center_pos = self.encoder(pc, feats)
 
@@ -274,19 +283,20 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
                 feats: torch.FloatTensor,
                 volume_queries: torch.FloatTensor,
                 sample_posterior: bool = True):
+        """
 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, C]
-        #     volume_queries (torch.FloatTensor): [B, P, 3]
-        #     sample_posterior (bool):
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
+            volume_queries (torch.FloatTensor): [B, P, 3]
+            sample_posterior (bool):
 
-        # Returns:
-        #     logits (torch.FloatTensor): [B, P]
-        #     center_pos (torch.FloatTensor): [B, M, 3]
-        #     posterior (DiagonalGaussianDistribution or None).
+        Returns:
+            logits (torch.FloatTensor): [B, P]
+            center_pos (torch.FloatTensor): [B, M, 3]
+            posterior (DiagonalGaussianDistribution or None).
 
-
+        """
 
         latents, center_pos, posterior = self.encode(pc, feats, sample_posterior=sample_posterior)
 
@@ -341,17 +351,18 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                pc: torch.FloatTensor,
                feats: Optional[torch.FloatTensor] = None,
                sample_posterior: bool = True):
+        """
 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, c]
-        #     sample_posterior (bool):
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, c]
+            sample_posterior (bool):
 
-        # Returns:
-        #     shape_embed (torch.FloatTensor)
-        #     kl_embed (torch.FloatTensor):
-        #     posterior (DiagonalGaussianDistribution or None):
-
+        Returns:
+            shape_embed (torch.FloatTensor)
+            kl_embed (torch.FloatTensor):
+            posterior (DiagonalGaussianDistribution or None):
+        """
 
         shape_embed, latents = self.encode_latents(pc, feats)
         kl_embed, posterior = self.encode_kl_embed(latents, sample_posterior)
@@ -389,18 +400,20 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 feats: torch.FloatTensor,
                 volume_queries: torch.FloatTensor,
                 sample_posterior: bool = True):
- 
-        # Args:
-        #     pc (torch.FloatTensor): [B, N, 3]
-        #     feats (torch.FloatTensor or None): [B, N, C]
-        #     volume_queries (torch.FloatTensor): [B, P, 3]
-        #     sample_posterior (bool):
+        """
 
-        # Returns:
-        #     shape_embed (torch.FloatTensor): [B, projection_dim]
-        #     logits (torch.FloatTensor): [B, M]
-        #     posterior (DiagonalGaussianDistribution or None).
+        Args:
+            pc (torch.FloatTensor): [B, N, 3]
+            feats (torch.FloatTensor or None): [B, N, C]
+            volume_queries (torch.FloatTensor): [B, P, 3]
+            sample_posterior (bool):
 
+        Returns:
+            shape_embed (torch.FloatTensor): [B, projection_dim]
+            logits (torch.FloatTensor): [B, M]
+            posterior (DiagonalGaussianDistribution or None).
+
+        """
 
         shape_embed, kl_embed, posterior = self.encode(pc, feats, sample_posterior=sample_posterior)
 

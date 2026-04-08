@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+"""
+Adapted from: https://github.com/openai/guided-diffusion/blob/22e0df8183507e13a7813f8d38d51b072ca1e67c/guided_diffusion/nn.py#L124
+"""
 
 import torch
 from typing import Callable, Iterable, Sequence, Union
@@ -11,14 +14,16 @@ def checkpoint(
     flag: bool,
     use_deepspeed: bool = False
 ):
-    # Evaluate a function without caching intermediate activations, allowing for
-    # reduced memory at the expense of extra compute in the backward pass.
-    # :param func: the function to evaluate.
-    # :param inputs: the argument sequence to pass to `func`.
-    # :param params: a sequence of parameters `func` depends on but does not
-    #                explicitly take as arguments.
-    # :param flag: if False, disable gradient checkpointing.
-    # :param use_deepspeed: if True, use deepspeed
+    """
+    Evaluate a function without caching intermediate activations, allowing for
+    reduced memory at the expense of extra compute in the backward pass.
+    :param func: the function to evaluate.
+    :param inputs: the argument sequence to pass to `func`.
+    :param params: a sequence of parameters `func` depends on but does not
+                   explicitly take as arguments.
+    :param flag: if False, disable gradient checkpointing.
+    :param use_deepspeed: if True, use deepspeed
+    """
     if flag:
         if use_deepspeed:
             import deepspeed

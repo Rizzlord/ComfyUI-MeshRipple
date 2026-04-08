@@ -2,7 +2,7 @@
 
 import numpy as np
 
-# produce dense points
+
 def generate_dense_grid_points(bbox_min: np.ndarray,
                                bbox_max: np.ndarray,
                                octree_depth: int,

@@ -1,12 +1,28 @@
-# -*- coding: utf-8 -*-
-
 import torch
 import numpy as np
 from typing import Union, List
 
 
+class AbstractDistribution(object):
+    def sample(self):
+        raise NotImplementedError()
+
+    def mode(self):
+        raise NotImplementedError()
+
+
+class DiracDistribution(AbstractDistribution):
+    def __init__(self, value):
+        self.value = value
+
+    def sample(self):
+        return self.value
+
+    def mode(self):
+        return self.value
+
+
 class DiagonalGaussianDistribution(object):
-    # Gaussian distribution
     def __init__(self, parameters: Union[torch.Tensor, List[torch.Tensor]], deterministic=False, feat_dim=1):
         self.feat_dim = feat_dim
         self.parameters = parameters
@@ -24,7 +40,6 @@ class DiagonalGaussianDistribution(object):
         if self.deterministic:
             self.var = self.std = torch.zeros_like(self.mean)
 
-    # sample from the guassian distribution
     def sample(self):
         x = self.mean + self.std * torch.randn_like(self.mean)
         return x
@@ -56,10 +71,12 @@ class DiagonalGaussianDistribution(object):
 
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
-    # Compute the KL divergence between two gaussians.
-    # Shapes are automatically broadcasted, so batches can be compared to
-    # scalars, among other use cases.
-
+    """
+    source: https://github.com/openai/guided-diffusion/blob/27c20a8fab9cb472df5d6bdd6c8d11c8f430b924/guided_diffusion/losses.py#L12
+    Compute the KL divergence between two gaussians.
+    Shapes are automatically broadcasted, so batches can be compared to
+    scalars, among other use cases.
+    """
     tensor = None
     for obj in (mean1, logvar1, mean2, logvar2):
         if isinstance(obj, torch.Tensor):

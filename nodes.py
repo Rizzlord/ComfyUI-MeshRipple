@@ -4,6 +4,7 @@ import torch
 import yaml
 import numpy as np
 import trimesh
+from PIL import Image
 # Add the MeshRipple directory to sys.path
 EXTENSION_DIR = os.path.dirname(os.path.realpath(__file__))
 MESH_RIPPLE_PATH = os.path.join(EXTENSION_DIR, "MeshRipple")
@@ -30,6 +31,10 @@ from model_compile.transformer import FaceBoundary
 from model_nsa_compile.transformer_nsa import NSAFaceBoundary
 from ripple_tokenizer.tokenizer import undiscretize_tensor
 from ripple_utils.data_process import process_predictions
+
+# Michelangelo Imports
+from michelangelo.utils.misc import get_config_from_file, instantiate_from_config
+from michelangelo.models.tsal.inference_utils import extract_geometry
 
 class MockAccelerator:
     def __init__(self):
@@ -80,6 +85,112 @@ def download_miche_model():
     
     return ckpt_path, config_path
 
+class MichelangeloModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        miche_dir = os.path.join(models_dir, "miche")
+        os.makedirs(miche_dir, exist_ok=True)
+        files = [f for f in os.listdir(miche_dir) if f.endswith(".ckpt")]
+        return {
+            "required": {
+                "model_name": (files,),
+            }
+        }
+    
+    RETURN_TYPES = ("MICHE_MODEL",)
+    FUNCTION = "load_model"
+    CATEGORY = "MeshRipple/Michelangelo"
+
+    def load_model(self, model_name):
+        ckpt_path = os.path.join(models_dir, "miche", model_name)
+        config_path = ckpt_path.replace(".ckpt", ".yaml")
+        
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found for model: {model_name}")
+            
+        model_config = get_config_from_file(config_path)
+        if hasattr(model_config, "model"):
+            model_config = model_config.model
+
+        print(f"Loading Michelangelo model from {ckpt_path}...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        model = instantiate_from_config(model_config, ckpt_path=ckpt_path)
+        model.to(device).eval()
+        
+        return ({"model": model, "config": model_config, "device": device},)
+
+class MichelangeloImageToPoints:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "miche_model": ("MICHE_MODEL",),
+                "image": ("IMAGE",),
+                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "num_steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536}),
+            }
+        }
+    
+    RETURN_TYPES = ("POINTS",)
+    FUNCTION = "generate_points"
+    CATEGORY = "MeshRipple/Michelangelo"
+
+    def generate_points(self, miche_model, image, guidance_scale, num_steps, seed, sample_points):
+        model = miche_model["model"]
+        device = miche_model["device"]
+        
+        torch.manual_seed(seed)
+        
+        # Preprocess image
+        # image is (B, H, W, C), range [0, 1]
+        img = image[0].cpu().numpy()
+        img = (img * 255).astype(np.uint8)
+        img = Image.fromarray(img).convert("RGB")
+        img = img.resize((224, 224), Image.LANCZOS)
+        
+        img_np = np.array(img).astype(np.float32) / 255.0
+        img_np = img_np * 2.0 - 1.0  # Normalize to [-1, 1]
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        sample_inputs = {"image": img_tensor}
+        
+        print(f"Sampling 3D shape from image with guidance_scale={guidance_scale}...")
+        # Check if the model is the diffuser or just the VAE
+        if hasattr(model, "sample"):
+            # It's the diffuser
+            mesh_outputs = model.sample(
+                sample_inputs,
+                sample_times=1,
+                steps=num_steps,
+                guidance_scale=guidance_scale,
+                bounds=[-1.1, -1.1, -1.1, 1.1, 1.1, 1.1],
+                octree_depth=7
+            )[0]
+        else:
+            # It's likely just the VAE, try to encode/decode (though this node is for image generation)
+            raise ValueError("The loaded Michelangelo model does not support sampling (it is likely a VAE, not a Diffuser). Please load an 'image-ASLDM' model.")
+
+        # Extract mesh from the first output
+        mesh_out = mesh_outputs[0]
+        if mesh_out is None:
+            raise ValueError("Michelangelo failed to generate a surface for this image.")
+            
+        # Michelangelo mesh faces are often inverted for some reason in their inference.py
+        faces = mesh_out.mesh_f[:, ::-1]
+        tm_mesh = trimesh.Trimesh(mesh_out.mesh_v, faces, process=False)
+        
+        # Sample points and normals
+        sampled_points, face_idx = tm_mesh.sample(sample_points, return_index=True)
+        normals = tm_mesh.face_normals[face_idx]
+        
+        points_6d = np.concatenate([sampled_points, normals], axis=-1).astype(np.float32)
+        points_tensor = torch.from_numpy(points_6d).unsqueeze(0) # (1, N, 6)
+        
+        return (points_tensor,)
+
 class MeshRippleModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -126,7 +237,7 @@ class MeshRippleModelLoader:
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Ensure Miche model is available
+        # Ensure Miche model is available (fallback)
         download_miche_model()
         
         if config.model.model_version == "full_attn":
@@ -160,13 +271,9 @@ class MeshRippleModelLoader:
         
         print(f"Loading MeshRipple weights from {ckpt_path}...")
         state_dict = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device).eval()
         
-        # Optional: compile model if config says so, but for now let's skip for stability
-        # if getattr(config.model, "use_compile", False):
-        #     model.compile_math_kernels()
-            
         return ({"model": model, "config": config, "token_map": token_map, "device": device},)
 
 class MeshRippleGenerator:
@@ -371,7 +478,7 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     eos_id = token_map["eos"]
     pad_id = token_map["pad"]
     
-    eos_mask = torch.eq(pred_token_unflatten, eos_id.to(device)).any(dim=2)
+    eos_mask = torch.eq(pred_token_unflatten.to(device), eos_id.to(device)).any(dim=2)
     pad_mask = torch.eq(pred_token_unflatten, pad_id.to(device)).any(dim=2)
     stop_mask = eos_mask | pad_mask
     
@@ -407,10 +514,14 @@ NODE_CLASS_MAPPINGS = {
     "MeshRippleModelLoader": MeshRippleModelLoader,
     "MeshRippleGenerator": MeshRippleGenerator,
     "MeshRippleRemesh": MeshRippleRemesh,
+    "MichelangeloModelLoader": MichelangeloModelLoader,
+    "MichelangeloImageToPoints": MichelangeloImageToPoints,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MeshRippleModelLoader": "MeshRipple Model Loader",
     "MeshRippleGenerator": "MeshRipple Generator",
     "MeshRippleRemesh": "MeshRipple Remesh",
+    "MichelangeloModelLoader": "Michelangelo Model Loader",
+    "MichelangeloImageToPoints": "Michelangelo Image to Points",
 }

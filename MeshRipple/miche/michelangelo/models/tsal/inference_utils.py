@@ -7,7 +7,7 @@ import numpy as np
 from typing import Callable, Tuple, List, Union, Optional
 from skimage import measure
 
-from miche.michelangelo.graphics.primitives import generate_dense_grid_points
+from michelangelo.graphics.primitives import generate_dense_grid_points
 
 
 @torch.no_grad()
@@ -18,16 +18,20 @@ def extract_geometry(geometric_func: Callable,
                      octree_depth: int = 7,
                      num_chunks: int = 10000,
                      disable: bool = True):
+    """
 
-    # Args:
-    #     geometric_func:
-    #     device:
-    #     bounds:
-    #     octree_depth:
-    #     batch_size:
-    #     num_chunks:
-    #     disable:
-    # Returns:
+    Args:
+        geometric_func:
+        device:
+        bounds:
+        octree_depth:
+        batch_size:
+        num_chunks:
+        disable:
+
+    Returns:
+
+    """
 
     if isinstance(bounds, float):
         bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]

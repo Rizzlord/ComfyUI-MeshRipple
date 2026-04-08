@@ -5,23 +5,24 @@ from omegaconf import DictConfig
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torch.optim import lr_scheduler
+import pytorch_lightning as pl
 from typing import Union
 from functools import partial
 
-from miche.michelangelo.utils import instantiate_from_config
+from michelangelo.utils import instantiate_from_config
 
+from .inference_utils import extract_geometry
 from .tsal_base import (
     AlignedShapeAsLatentModule,
     ShapeAsLatentModule,
     Latent2MeshOutput,
     AlignedMeshOutput
 )
-from miche.michelangelo.models.tsal.inference_utils import extract_geometry
-import trimesh
 
-class AlignedShapeAsLatentPLModule(nn.Module):
+
+class AlignedShapeAsLatentPLModule(pl.LightningModule):
+
     def __init__(self, *,
                  shape_module_cfg,
                  aligned_module_cfg,
@@ -45,6 +46,8 @@ class AlignedShapeAsLatentPLModule(nn.Module):
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+        self.save_hyperparameters()
 
     def set_shape_model_only(self):
         self.model.set_shape_model_only()
@@ -108,13 +111,18 @@ class AlignedShapeAsLatentPLModule(nn.Module):
                 image: torch.FloatTensor,
                 text: torch.FloatTensor,
                 volume_queries: torch.FloatTensor):
-        # Args:
-        #     surface (torch.FloatTensor):
-        #     image (torch.FloatTensor):
-        #     text (torch.FloatTensor):
-        #     volume_queries (torch.FloatTensor):
-        # 
-        # Returns:
+
+        """
+
+        Args:
+            surface (torch.FloatTensor):
+            image (torch.FloatTensor):
+            text (torch.FloatTensor):
+            volume_queries (torch.FloatTensor):
+
+        Returns:
+
+        """
 
         embed_outputs, shape_z = self.model(surface, image, text)
 
@@ -123,6 +131,12 @@ class AlignedShapeAsLatentPLModule(nn.Module):
         logits = self.model.shape_model.query_geometry(volume_queries, latents)
 
         return embed_outputs, logits, posterior
+
+    def encode_latents(self, surface: torch.FloatTensor):
+        pc = surface[..., 0:3]
+        feats = surface[..., 3:6]
+        x, _ = self.model.shape_model.encoder(pc, feats)
+        return x
 
     def encode(self, surface: torch.FloatTensor, sample_posterior=True):
 
@@ -134,48 +148,6 @@ class AlignedShapeAsLatentPLModule(nn.Module):
         )
 
         return shape_zq
-
-    def encode_latents(self, surface: torch.FloatTensor):
-
-        pc = surface[..., 0:3]
-        feats = surface[..., 3:6]
-
-        shape_embed, shape_latents = self.model.shape_model.encode_latents(
-            pc=pc, feats=feats
-        )
-        shape_embed = shape_embed.unsqueeze(1)
-        assert shape_embed.shape[1] == 1 and shape_latents.shape[1] == 256
-        cat_latents = torch.cat([shape_embed, shape_latents], dim=1)
-
-        return cat_latents
-
-    def recon(self, surface):
-        cat_latents = self.encode_latents(surface)
-        shape_latents = cat_latents[:, 1:]
-        shape_zq, posterior = self.model.shape_model.encode_kl_embed(shape_latents)
-
-        # decoding
-        latents = self.model.shape_model.decode(shape_zq)
-        geometric_func = partial(self.model.shape_model.query_geometry, latents=latents)
-
-        # reconstruction
-        mesh_v_f, has_surface = extract_geometry(
-            geometric_func=geometric_func,
-            device=surface.device,
-            batch_size=surface.shape[0],
-            bounds=(-1.25, -1.25, -1.25, 1.25, 1.25, 1.25),
-            octree_depth=7,
-            num_chunks=10000,
-        )
-        recon_mesh = trimesh.Trimesh(mesh_v_f[0][0], mesh_v_f[0][1])
-
-        return recon_mesh
-
-
-    def to_shape_latents(self, latents):
-
-        shape_zq, posterior = self.model.shape_model.encode_kl_embed(latents, sample_posterior = False)
-        return self.model.shape_model.decode(shape_zq)
 
     def decode(self,
                z_q,
@@ -190,19 +162,23 @@ class AlignedShapeAsLatentPLModule(nn.Module):
 
     def training_step(self, batch: Dict[str, torch.FloatTensor],
                       batch_idx: int, optimizer_idx: int = 0) -> torch.FloatTensor:
-        #Args:
-        #    batch (dict): the batch sample, and it contains:
-        #        - surface (torch.FloatTensor): [bs, n_surface, (3 + input_dim)]
-        #        - image (torch.FloatTensor): [bs, 3, 224, 224]
-        #        - text (torch.FloatTensor): [bs, num_templates, 77]
-        #        - geo_points (torch.FloatTensor): [bs, n_pts, (3 + 1)]
-        #
-        #    batch_idx (int):
-        #
-        #    optimizer_idx (int):
-        #
-        # Returns:
-        #    loss (torch.FloatTensor):
+        """
+
+        Args:
+            batch (dict): the batch sample, and it contains:
+                - surface (torch.FloatTensor): [bs, n_surface, (3 + input_dim)]
+                - image (torch.FloatTensor): [bs, 3, 224, 224]
+                - text (torch.FloatTensor): [bs, num_templates, 77]
+                - geo_points (torch.FloatTensor): [bs, n_pts, (3 + 1)]
+
+            batch_idx (int):
+
+            optimizer_idx (int):
+
+        Returns:
+            loss (torch.FloatTensor):
+
+        """
 
         surface = batch["surface"]
         image = batch["image"]
@@ -381,3 +357,4 @@ class AlignedShapeAsLatentPLModule(nn.Module):
             outputs.append(out)
 
         return outputs
+

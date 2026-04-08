@@ -5,27 +5,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-from miche.michelangelo.models.modules.checkpoint import checkpoint
 
-# Initialize linear layers with normal distribution weights and zero biases
+from michelangelo.models.modules.checkpoint import checkpoint
+
+
 def init_linear(l, stddev):
     nn.init.normal_(l.weight, std=stddev)
     if l.bias is not None:
         nn.init.constant_(l.bias, 0.0)
 
-# Multihead attention module
+
 class MultiheadAttention(nn.Module):
     def __init__(
         self,
         *,
         device: torch.device,
         dtype: torch.dtype,
-        n_ctx: int,  # Context size
-        width: int,  # Width of the input tensor
-        heads: int,  # Number of attention heads
-        init_scale: float,  # Initialization scale for weights
-        qkv_bias: bool,  # Whether to use bias in QKV layers
-        flash: bool = False  # Whether to use flash attention
+        n_ctx: int,
+        width: int,
+        heads: int,
+        init_scale: float,
+        qkv_bias: bool,
+        flash: bool = False
     ):
         super().__init__()
         self.n_ctx = n_ctx
@@ -43,7 +44,7 @@ class MultiheadAttention(nn.Module):
         x = self.c_proj(x)
         return x
 
-# QKV multihead attention module
+
 class QKVMultiheadAttention(nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype, heads: int, n_ctx: int, flash: bool = False):
         super().__init__()
@@ -60,29 +61,32 @@ class QKVMultiheadAttention(nn.Module):
         qkv = qkv.view(bs, n_ctx, self.heads, -1)
         q, k, v = torch.split(qkv, attn_ch, dim=-1)
 
-        weight = torch.einsum(
-            "bthc,bshc->bhts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        wdtype = weight.dtype
-        weight = torch.softmax(weight.float(), dim=-1).type(wdtype)
-        out = torch.einsum("bhts,bshc->bthc", weight, v).reshape(bs, n_ctx, -1)
+        if self.flash:
+            out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            weight = torch.einsum(
+                "bthc,bshc->bhts", q * scale, k * scale
+            )  # More stable with f16 than dividing afterwards
+            wdtype = weight.dtype
+            weight = torch.softmax(weight.float(), dim=-1).type(wdtype)
+            out = torch.einsum("bhts,bshc->bthc", weight, v).reshape(bs, n_ctx, -1)
 
         return out
 
-# Residual attention block module
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(
         self,
         *,
         device: torch.device,
         dtype: torch.dtype,
-        use_checkpoint: bool = False, 
-        n_ctx: int,  # Context size
-        width: int,  # Width of the input tensor
-        heads: int,  # Number of attention heads
-        init_scale: float,  # Initialization scale for weights
-        qkv_bias: bool,  # Whether to use bias in QKV layers
-        flash: bool = False  # Whether to use flash attention
+        n_ctx: int,
+        width: int,
+        heads: int,
+        init_scale: float = 1.0,
+        qkv_bias: bool = True,
+        flash: bool = False,
+        use_checkpoint: bool = False
     ):
         super().__init__()
 
@@ -110,20 +114,20 @@ class ResidualAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor):
         return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
 
-# Multihead cross attention module
+
 class MultiheadCrossAttention(nn.Module):
     def __init__(
         self,
         *,
         device: torch.device,
         dtype: torch.dtype,
+        width: int,
+        heads: int,
+        init_scale: float,
+        qkv_bias: bool = True,
+        flash: bool = False,
         n_data: Optional[int] = None,
         data_width: Optional[int] = None,
-        width: int,  # Width of the input tensor
-        heads: int,  # Number of attention heads
-        init_scale: float,  # Initialization scale for weights
-        qkv_bias: bool,  # Whether to use bias in QKV layers
-        flash: bool = False  # Whether to use flash attention
     ):
         super().__init__()
         self.n_data = n_data
@@ -147,7 +151,7 @@ class MultiheadCrossAttention(nn.Module):
         x = self.c_proj(x)
         return x
 
-# QKV multihead cross attention module
+
 class QKVMultiheadCrossAttention(nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype, heads: int,
                  flash: bool = False, n_data: Optional[int] = None):
@@ -168,16 +172,19 @@ class QKVMultiheadCrossAttention(nn.Module):
         kv = kv.view(bs, n_data, self.heads, -1)
         k, v = torch.split(kv, attn_ch, dim=-1)
 
-        weight = torch.einsum(
-            "bthc,bshc->bhts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        wdtype = weight.dtype
-        weight = torch.softmax(weight.float(), dim=-1).type(wdtype)
-        out = torch.einsum("bhts,bshc->bthc", weight, v).reshape(bs, n_ctx, -1)
+        if self.flash:
+            out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            weight = torch.einsum(
+                "bthc,bshc->bhts", q * scale, k * scale
+            )  # More stable with f16 than dividing afterwards
+            wdtype = weight.dtype
+            weight = torch.softmax(weight.float(), dim=-1).type(wdtype)
+            out = torch.einsum("bhts,bshc->bthc", weight, v).reshape(bs, n_ctx, -1)
 
         return out
 
-# Residual cross attention block module
+
 class ResidualCrossAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -185,12 +192,12 @@ class ResidualCrossAttentionBlock(nn.Module):
         device: Optional[torch.device],
         dtype: Optional[torch.dtype],
         n_data: Optional[int] = None,
+        width: int,
+        heads: int,
         data_width: Optional[int] = None,
-        width: int,  # Width of the input tensor
-        heads: int,  # Number of attention heads
-        init_scale: float,  # Initialization scale for weights
-        qkv_bias: bool,  # Whether to use bias in QKV layers
-        flash: bool = False  # Whether to use flash attention
+        init_scale: float = 0.25,
+        qkv_bias: bool = True,
+        flash: bool = False
     ):
         super().__init__()
 
@@ -218,7 +225,7 @@ class ResidualCrossAttentionBlock(nn.Module):
         x = x + self.mlp(self.ln_3(x))
         return x
 
-# MLP Module
+
 class MLP(nn.Module):
     def __init__(self, *,
                  device: Optional[torch.device],
@@ -236,21 +243,21 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.c_proj(self.gelu(self.c_fc(x)))
 
-# Transformer Module
+
 class Transformer(nn.Module):
     def __init__(
         self,
         *,
         device: Optional[torch.device],
         dtype: Optional[torch.dtype],
+        n_ctx: int,
+        width: int,
         layers: int,
-        use_checkpoint: bool = False,
-        n_ctx: int,  # Context size
-        width: int,  # Width of the input tensor
-        heads: int,  # Number of attention heads
-        init_scale: float,  # Initialization scale for weights
-        qkv_bias: bool,  # Whether to use bias in QKV layers
-        flash: bool = False  # Whether to use flash attention
+        heads: int,
+        init_scale: float = 0.25,
+        qkv_bias: bool = True,
+        flash: bool = False,
+        use_checkpoint: bool = False
     ):
         super().__init__()
         self.n_ctx = n_ctx

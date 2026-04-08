@@ -2,39 +2,39 @@
 
 import torch.nn as nn
 from typing import Tuple, List, Optional
+import pytorch_lightning as pl
 
-# Base class for output of Point to Mesh transformation
+
 class Point2MeshOutput(object):
     def __init__(self):
-        self.mesh_v = None  # Vertices of the mesh
-        self.mesh_f = None  # Faces of the mesh
-        self.center = None  # Center of the mesh
-        self.pc = None  # Point cloud data
+        self.mesh_v = None
+        self.mesh_f = None
+        self.center = None
+        self.pc = None
 
 
-# Base class for output of Latent to Mesh transformation
 class Latent2MeshOutput(object):
+
     def __init__(self):
-        self.mesh_v = None  # Vertices of the mesh
-        self.mesh_f = None  # Faces of the mesh
+        self.mesh_v = None
+        self.mesh_f = None
 
 
-# Base class for output of Aligned Mesh transformation
 class AlignedMeshOutput(object):
+
     def __init__(self):
-        self.mesh_v = None  # Vertices of the mesh
-        self.mesh_f = None  # Faces of the mesh
-        self.surface = None  # Surface data
-        self.image = None  # Aligned image data
-        self.text: Optional[str] = None  # Aligned text data
-        self.shape_text_similarity: Optional[float] = None  # Similarity between shape and text
-        self.shape_image_similarity: Optional[float] = None  # Similarity between shape and image
+        self.mesh_v = None
+        self.mesh_f = None
+        self.surface = None
+        self.image = None
+        self.text: Optional[str] = None
+        self.shape_text_similarity: Optional[float] = None
+        self.shape_image_similarity: Optional[float] = None
 
 
-# Base class for Shape as Latent with Point to Mesh transformation module
-class ShapeAsLatentPLModule(nn.Module):
-    latent_shape: Tuple[int]  # Shape of the latent space
-    
+class ShapeAsLatentPLModule(pl.LightningModule):
+    latent_shape: Tuple[int]
+
     def encode(self, surface, *args, **kwargs):
         raise NotImplementedError
 
@@ -48,9 +48,8 @@ class ShapeAsLatentPLModule(nn.Module):
         raise NotImplementedError
 
 
-# Base class for Shape as Latent module
 class ShapeAsLatentModule(nn.Module):
-    latent_shape: Tuple[int, int]  # Shape of the latent space
+    latent_shape: Tuple[int, int]
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -65,9 +64,8 @@ class ShapeAsLatentModule(nn.Module):
         raise NotImplementedError
 
 
-# Base class for Aligned Shape as Latent with Point to Mesh transformation module
-class AlignedShapeAsLatentPLModule(nn.Module):
-    latent_shape: Tuple[int]  # Shape of the latent space
+class AlignedShapeAsLatentPLModule(pl.LightningModule):
+    latent_shape: Tuple[int]
 
     def set_shape_model_only(self):
         raise NotImplementedError
@@ -85,11 +83,9 @@ class AlignedShapeAsLatentPLModule(nn.Module):
         raise NotImplementedError
 
 
-# Base class for Aligned Shape as Latent module
 class AlignedShapeAsLatentModule(nn.Module):
-    shape_model: ShapeAsLatentModule  # Shape model module
-    latent_shape: Tuple[int, int]  # Shape of the latent space
-
+    shape_model: ShapeAsLatentModule
+    latent_shape: Tuple[int, int]
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -106,7 +102,7 @@ class AlignedShapeAsLatentModule(nn.Module):
     def encode_shape_embed(self, *args, **kwargs):
         raise NotImplementedError
 
-# Base class for Textured Shape as Latent module
+
 class TexturedShapeAsLatentModule(nn.Module):
 
     def __init__(self, *args, **kwargs):
