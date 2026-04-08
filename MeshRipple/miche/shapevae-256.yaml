@@ -20,7 +20,7 @@ model:
     aligned_module_cfg:
       target: miche.michelangelo.models.tsal.clip_asl_module.CLIPAlignedShapeAsLatentModule
       params:
-        clip_model_version: "./checkpoints/clip/clip-vit-large-patch14"
+        clip_model_version: "openai/clip-vit-large-patch14"
 
     loss_cfg:
       target: miche.michelangelo.models.tsal.loss.ContrastKLNearFar

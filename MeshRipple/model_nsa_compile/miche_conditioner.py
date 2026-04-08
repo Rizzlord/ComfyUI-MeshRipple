@@ -31,16 +31,31 @@ class PointConditioner(torch.nn.Module):
 
         # open-source version of miche
         if model_name == 'miche-256-feature':
-            # Resolve paths relative to this file to avoid CWD issues
+            # Resolve paths dynamically
             current_dir = os.path.dirname(os.path.realpath(__file__))
             miche_root = os.path.join(os.path.dirname(current_dir), "miche")
             
-            ckpt_path = os.path.join(miche_root, "shapevae-256.ckpt")
-            if not os.path.exists(ckpt_path):
+            # Check for ComfyUI models directory (go up 3 levels from MeshRipple/model_nsa_compile to custom_nodes, then 1 more to root)
+            comfy_models_miche = os.path.abspath(os.path.join(current_dir, "../../../../../models/miche/"))
+            
+            ckpt_name = "shapevae-256.ckpt"
+            yaml_name = "shapevae-256.yaml"
+            
+            # Prioritize ComfyUI/models/miche/
+            primary_ckpt = os.path.join(comfy_models_miche, ckpt_name)
+            primary_yaml = os.path.join(comfy_models_miche, yaml_name)
+            
+            if os.path.exists(primary_ckpt):
+                ckpt_path = primary_ckpt
+                config_path = primary_yaml
+            else:
+                # Fallback to local extension dir
+                ckpt_path = os.path.join(miche_root, ckpt_name)
+                config_path = os.path.join(miche_root, yaml_name)
+            
+            if not (ckpt_path and os.path.exists(ckpt_path)):
                 ckpt_path=None
-                print('[WARNING] Michelangelo ckpt not exist, please check if you are training')
-                
-            config_path = os.path.join(miche_root, 'shapevae-256.yaml')
+                print(f'[WARNING] Michelangelo ckpt not found at {primary_ckpt} or {os.path.join(miche_root, ckpt_name)}')
 
             self.feature_dim = feature_dim    # embedding dimension
             self.cond_length = 257     # length of embedding

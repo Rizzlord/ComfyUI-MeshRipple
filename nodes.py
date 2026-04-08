@@ -146,6 +146,7 @@ class Img2PointT2:
                 "simplification_method": (["none", "cumesh", "meshlib"], {"default": "none"}),
                 "simplification_target": ("INT", {"default": 50000, "min": 1000, "max": 1000000, "step": 1000}),
                 "fill_holes_with_meshlib": ("BOOLEAN", {"default": True}),
+                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536, "tooltip": "Number of points to sample from the final mesh. 16,384 is the default for MeshRipple."}),
             }
         }
 
@@ -154,7 +155,7 @@ class Img2PointT2:
     FUNCTION = "generate"
     CATEGORY = "MeshRipple"
 
-    def generate(self, image, seed, shape_resolution, cascade_resolution, reconstruct_with_quad, remesh_resolution, simplification_method, simplification_target, fill_holes_with_meshlib):
+    def generate(self, image, seed, shape_resolution, cascade_resolution, reconstruct_with_quad, remesh_resolution, simplification_method, simplification_target, fill_holes_with_meshlib, sample_points):
         T2Pipeline, T2MeshWithVoxel = import_trellis2()
         if not T2Pipeline:
             raise Exception("Trellis2 not found. Please install trellis2 comfyui nodes.")
@@ -311,14 +312,13 @@ class Img2PointT2:
         pbar.update(1)
 
         # 6. Sample Points from FINAL PROCESSED mesh
-        import trimesh
+        import trimesh as tm_module
         # Use trimesh for sampling as it's more robust on decimated/cleaned meshes
-        tm = trimesh.Trimesh(vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy())
+        tm = tm_module.Trimesh(vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy())
         
-        N = 16384
-        print(f"Sampling {N} points from final processed mesh...")
+        print(f"Sampling {sample_points} points from final processed mesh...")
         # Use simple barycentric sampling on trimesh
-        points, face_indices = trimesh.sample.sample_surface(tm, N)
+        points, face_indices = tm_module.sample.sample_surface(tm, sample_points)
         sampled_normals = tm.face_normals[face_indices]
         
         points_tensor = torch.from_numpy(points).float()
@@ -565,13 +565,14 @@ class MeshRippleGenerator:
         return {
             "required": {
                 "mesh_ripple_model": ("MESH_RIPPLE_MODEL",),
-                "points": ("POINTS",), # Expects (N, 3) or (N, 6) tensor
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                "top_k": ("INT", {"default": 50, "min": 1, "max": 100}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0}),
-                "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000}),
-                "use_kv_cache": ("BOOLEAN", {"default": True}),
+                "points": ("POINTS", {"tooltip": "Input point cloud with normals."}),
+                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536, "tooltip": "Target number of points for the generator. Default 16384 is recommended by the paper."}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Random seed for generation."}),
+                "top_k": ("INT", {"default": 50, "min": 1, "max": 100, "tooltip": "Limits sampling to the top K most likely tokens. Higher = more diverse but riskier."}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "tooltip": "Nucleus sampling threshold. Filters out lower probability noise."}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0, "tooltip": "Controls randomness. <1.0 is safer/tighter, >1.0 is more experimental."}),
+                "max_faces": ("INT", {"default": 5000, "min": 100, "max": 60000, "tooltip": "Maximum number of faces to generate before auto-stopping."}),
+                "use_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Enables Key-Value caching for massive speedup. This is mathematically lossless."}),
             }
         }
     
@@ -579,7 +580,7 @@ class MeshRippleGenerator:
     FUNCTION = "generate_mesh"
     CATEGORY = "MeshRipple"
 
-    def generate_mesh(self, mesh_ripple_model, points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
+    def generate_mesh(self, mesh_ripple_model, points, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
         # Prepare points
         # If points is (B, N, 3/6), take first batch
         if points.ndim == 3:
@@ -591,6 +592,20 @@ class MeshRippleGenerator:
             normals = torch.zeros_like(points)
             points = torch.cat([points, normals], dim=1)
         
+        # Ensure exact number of points required by model
+        num_in = points.shape[0]
+        if num_in != sample_points:
+            print(f"Resampling point cloud from {num_in} to {sample_points}...")
+            if num_in > sample_points:
+                # Randomly sample
+                torch.manual_seed(seed)
+                indices = torch.randperm(num_in)[:sample_points]
+                points = points[indices]
+            else:
+                # Padding or repetition
+                repeats = (sample_points // num_in) + 1
+                points = points.repeat(repeats, 1)[:sample_points]
+
         # Normalize points to [-0.5, 0.5]
         p_min = points[:, :3].min(dim=0)[0]
         p_max = points[:, :3].max(dim=0)[0]
@@ -609,14 +624,14 @@ class MeshRippleRemesh:
         return {
             "required": {
                 "mesh_ripple_model": ("MESH_RIPPLE_MODEL",),
-                "mesh": ("*", {"forceInput": True}), # Use '*' to allow various 3D node outputs (MESH, TRIMESH, etc.)
-                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                "top_k": ("INT", {"default": 50, "min": 1, "max": 100}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0}),
-                "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000}),
-                "use_kv_cache": ("BOOLEAN", {"default": True}),
+                "mesh": ("*", {"forceInput": True, "tooltip": "Input mesh to be remeshed."}),
+                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536, "tooltip": "Number of points to sample from input mesh for conditioning."}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Random seed."}),
+                "top_k": ("INT", {"default": 50, "min": 1, "max": 100, "tooltip": "Sampling top K tokens."}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "tooltip": "Nucleus sampling threshold."}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0, "tooltip": "Randomness control."}),
+                "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000, "tooltip": "Face generation limit."}),
+                "use_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Lossless KV caching for faster generation."}),
             }
         }
     
