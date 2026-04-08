@@ -58,6 +58,19 @@ class DictToObject:
             else:
                 setattr(self, key, value)
 
+class SimpleMesh:
+    def __init__(self, vertices, faces):
+        self.vertices = vertices
+        self.faces = faces
+    def __getitem__(self, key):
+        if key == "vertices": return self.vertices
+        if key == "faces": return self.faces
+        raise KeyError(key)
+    def keys(self):
+        return ["vertices", "faces"]
+    def __contains__(self, key):
+        return key in ["vertices", "faces"]
+
 def download_miche_model():
     miche_dir = os.path.join(models_dir, "miche")
     os.makedirs(miche_dir, exist_ok=True)
@@ -84,6 +97,162 @@ def download_miche_model():
             os.rename(downloaded_path, ckpt_path)
     
     return ckpt_path, config_path
+
+def find_trellis2():
+    custom_nodes_dir = os.path.dirname(EXTENSION_DIR)
+    # Common directory names for Trellis2
+    possible_names = ["ComfyUI-Trellis2", "ComfyUI-Trellis", "trellis2", "trellis"]
+    
+    for name in possible_names:
+        path = os.path.join(custom_nodes_dir, name)
+        if os.path.exists(path):
+            return path
+            
+    # Fallback: scan all directories for a trellis-like name
+    if os.path.exists(custom_nodes_dir):
+        for d in os.listdir(custom_nodes_dir):
+            if "trellis" in d.lower():
+                return os.path.join(custom_nodes_dir, d)
+    return None
+
+def import_trellis2():
+    trellis2_path = find_trellis2()
+    if not trellis2_path:
+        return None, None
+    
+    if trellis2_path not in sys.path:
+        sys.path.append(trellis2_path)
+        
+    try:
+        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        from trellis2.representations import MeshWithVoxel
+        return Trellis2ImageTo3DPipeline, MeshWithVoxel
+    except ImportError:
+        return None, None
+
+class Img2PointT2:
+    _pipeline_cache = {}
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "seed": ("INT", {"default": 1337, "min": 0, "max": 0x7fffffff}),
+                "sparse_structure_resolution": ("INT", {"default": 32, "min": 32, "max": 128, "step": 4}),
+                "cascade_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 128}),
+                "reconstruct_with_quad": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("POINTS",)
+    FUNCTION = "generate"
+    CATEGORY = "MeshRipple"
+
+    def generate(self, image, seed, sparse_structure_resolution, cascade_resolution, reconstruct_with_quad):
+        T2Pipeline, T2MeshWithVoxel = import_trellis2()
+        if not T2Pipeline:
+            raise Exception("Trellis2 not found. Please install trellis2 comfyui nodes.")
+
+        # Cache the pipeline to avoid reloading weights
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_id = "microsoft/TRELLIS.2-4B"
+        
+        if model_id not in self._pipeline_cache:
+            print(f"Loading Trellis2 model: {model_id}...")
+            # Using defaults from the high-quality workflow
+            pipe = T2Pipeline.from_pretrained(model_id, keep_models_loaded=True)
+            pipe.to(device)
+            self._pipeline_cache[model_id] = pipe
+        
+        pipeline = self._pipeline_cache[model_id]
+
+        # Convert IMAGE tensor (B, H, W, C) to PIL
+        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        pil_img = Image.fromarray(img_np)
+
+        # Settings from trellis2meshgen.json
+        sampler_params = {
+            "steps": 12,
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.01,
+            "rescale_t": 4.0
+        }
+
+        from comfy.utils import ProgressBar
+        pbar = ProgressBar(10) # Cascade has roughly 10 major steps
+
+        print(f"Running Trellis2 cascade for points (Seed: {seed})...")
+        outputs = pipeline.run_cascade(
+            image=pil_img,
+            seed=seed,
+            sparse_structure_sampler_params=sampler_params,
+            low_res_shape_slat_sampler_params=sampler_params,
+            high_res_shape_slat_sampler_params=sampler_params,
+            generate_texture_slat=False, # We only need points
+            use_tiled=True,
+            max_num_tokens=999999,
+            sparse_structure_resolution=sparse_structure_resolution,
+            cascade_resolution=cascade_resolution, # Added
+            fill_holes=True,
+            keep_only_shell=True,
+            pbar=pbar # Fix: Provide pbar
+        )
+
+        mesh = outputs[0] # MeshWithVoxel
+        
+        # Optional Quad Remesh
+        if reconstruct_with_quad:
+            import cumesh
+            print(f"Reconstructing mesh with quad (Resolution: {cascade_resolution})...")
+            # DC Quad remeshing builds better topology for point sampling
+            new_verts, new_faces = cumesh.remeshing.reconstruct_mesh_dc_quad(
+                mesh.vertices.cuda(), 
+                mesh.faces.cuda(), 
+                cascade_resolution, 
+                verbose=True
+            )
+            mesh.vertices = new_verts.cpu()
+            mesh.faces = new_faces.cpu()
+        
+        # Sample points from the mesh
+        # MeshWithVoxel has .vertices and .faces as tensors
+        verts = mesh.vertices.to(device)
+        faces = mesh.faces.to(device)
+        
+        # Simple uniform sampling on faces
+        # 1. Compute face areas
+        v0 = verts[faces[:, 0]]
+        v1 = verts[faces[:, 1]]
+        v2 = verts[faces[:, 2]]
+        areas = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
+        
+        num_points = 16384
+        # 2. Sample face indices based on area
+        face_indices = torch.multinomial(areas, num_points, replacement=True)
+        
+        # 3. Sample barycentric coordinates
+        r1 = torch.sqrt(torch.rand(num_points, device=device))
+        r2 = torch.rand(num_points, device=device)
+        u = 1 - r1
+        v = r1 * (1 - r2)
+        w = r1 * r2
+        
+        # 4. Interpolate points
+        p0 = verts[faces[face_indices, 0]]
+        p1 = verts[faces[face_indices, 1]]
+        p2 = verts[faces[face_indices, 2]]
+        points = u.unsqueeze(1) * p0 + v.unsqueeze(1) * p1 + w.unsqueeze(1) * p2
+        
+        # 5. Compute Normals (per face)
+        normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+        normals = torch.nn.functional.normalize(normals, dim=1)
+        sampled_normals = normals[face_indices]
+        
+        # 6. Combine to (N, 6)
+        pc_normal = torch.cat([points, sampled_normals], dim=1) # (N, 6)
+        
+        return (pc_normal.unsqueeze(0),) # (1, N, 6)
 
 class MichelangeloModelLoader:
     @classmethod
@@ -520,7 +689,7 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     unique_vertices, inverse_indices = torch.unique(all_vertices, sorted=False, dim=0, return_inverse=True)
     faces_indices = inverse_indices.view(-1, 3)
     
-    return ({"vertices": unique_vertices.unsqueeze(0), "faces": faces_indices.unsqueeze(0)},)
+    return (SimpleMesh(unique_vertices.unsqueeze(0), faces_indices.unsqueeze(0)),)
 
 NODE_CLASS_MAPPINGS = {
     "MeshRippleModelLoader": MeshRippleModelLoader,
@@ -528,6 +697,7 @@ NODE_CLASS_MAPPINGS = {
     "MeshRippleRemesh": MeshRippleRemesh,
     "MichelangeloModelLoader": MichelangeloModelLoader,
     "MichelangeloImageToPoints": MichelangeloImageToPoints,
+    "Img2PointT2": Img2PointT2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -536,4 +706,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MeshRippleRemesh": "MeshRipple Remesh",
     "MichelangeloModelLoader": "Michelangelo Model Loader",
     "MichelangeloImageToPoints": "Michelangelo Image to Points",
+    "Img2PointT2": "Trellis2 Image to Points",
 }

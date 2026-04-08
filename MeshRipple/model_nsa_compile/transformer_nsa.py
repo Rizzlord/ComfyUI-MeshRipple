@@ -957,19 +957,19 @@ class NSAFaceBoundary(nn.Module):
             self._math_scale_1,
             mode=compile_mode,
             fullgraph=False,
-            dynamic=False,
+            dynamic=True,
         )
         self._math_scale_3 = torch.compile(
             self._math_scale_3,
             mode=compile_mode,
             fullgraph=False,
-            dynamic=False,
+            dynamic=True,
         )
         self._math_scale_9 = torch.compile(
             self._math_scale_9,
             mode=compile_mode,
             fullgraph=False,
-            dynamic=False,
+            dynamic=True,
         )
         print(f"[{self.__class__.__name__}] Math kernels successfully compiled with mode: {compile_mode}")
     
