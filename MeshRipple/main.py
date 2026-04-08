@@ -5,8 +5,8 @@ from torch.utils.data import DataLoader
 from functools import partial
 from accelerate import Accelerator, InitProcessGroupKwargs
 from data_load.mesh_dataset_more_aug import  MeshDataset_infer
-from utils.data_process import process_predictions
-from utils.utils import count_model_params
+from ripple_utils.data_process import process_predictions
+from ripple_utils.utils import count_model_params
 from model_nsa_compile.transformer_nsa import NSAFaceBoundary
 from model_compile.transformer import FaceBoundary
 from config_loader.load_config import load_config

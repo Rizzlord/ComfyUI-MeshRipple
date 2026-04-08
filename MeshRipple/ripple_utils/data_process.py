@@ -1,6 +1,6 @@
 
 import torch
-from boundary_token.tokenizer import undiscretize_tensor
+from ripple_tokenizer.tokenizer import undiscretize_tensor
 import trimesh
 import os
 import torch.nn.functional as F

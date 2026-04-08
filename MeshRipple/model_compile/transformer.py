@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from utils.utils import update_eos_mask
+from ripple_utils.utils import update_eos_mask
 import math
 from einops import rearrange
 from .miche_conditioner import PointConditioner

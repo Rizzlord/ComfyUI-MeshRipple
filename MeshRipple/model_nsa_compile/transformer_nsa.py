@@ -10,7 +10,7 @@ from tqdm import tqdm
 import tqdm as tqdm1
 import timm
 
-from utils.utils import update_eos_mask
+from ripple_utils.utils import update_eos_mask
 from torch.optim.lr_scheduler import LambdaLR
 import subprocess
 import math

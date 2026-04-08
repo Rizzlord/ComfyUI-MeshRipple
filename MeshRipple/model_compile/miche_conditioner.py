@@ -30,11 +30,24 @@ class PointConditioner(torch.nn.Module):
 
         # open-source version of miche
         if model_name == 'miche-256-feature':
-            ckpt_path = "miche/shapevae-256.ckpt"
+            try:
+                import folder_paths
+                miche_dir = os.path.join(folder_paths.models_dir, "miche")
+            except:
+                miche_dir = "miche"
+                
+            ckpt_path = os.path.join(miche_dir, "shapevae-256.ckpt")
+            config_path = os.path.join(miche_dir, "shapevae-256.yaml")
+            
+            if not os.path.exists(ckpt_path):
+                # Try relative to the extension root (miche folder)
+                root_miche = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "miche")
+                ckpt_path = os.path.join(root_miche, "shapevae-256.ckpt")
+                config_path = os.path.join(root_miche, "shapevae-256.yaml")
+
             if not os.path.exists(ckpt_path):
                 ckpt_path=None
-                print('[WARNING] Michelangelo ckpt not exist, please check if you are training')
-            config_path = 'miche/shapevae-256.yaml'
+                print(f'[WARNING] Michelangelo ckpt not exist at {miche_dir}, please check if you are training')
 
             self.feature_dim = feature_dim    # embedding dimension
             self.cond_length = 257     # length of embedding
