@@ -194,10 +194,6 @@ class MeshRippleGenerator:
                 "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0, "tooltip": "Controls randomness. <1.0 is safer/tighter, >1.0 is more experimental."}),
                 "max_faces": ("INT", {"default": 5000, "min": 100, "max": 60000, "tooltip": "Maximum number of faces to generate before auto-stopping."}),
                 "use_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Enables Key-Value caching for massive speedup. This is mathematically lossless."}),
-                "rotation_x": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotate output mesh around X axis in degrees."}),
-                "rotation_y": ("FLOAT", {"default": 180.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotate output mesh around Y axis in degrees."}),
-                "rotation_z": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotate output mesh around Z axis in degrees."}),
-                "flip_normals": ("BOOLEAN", {"default": False, "tooltip": "Flip the face winding order to correct inverted normals."}),
             }
         }
     
@@ -206,7 +202,7 @@ class MeshRippleGenerator:
     FUNCTION = "generate_mesh"
     CATEGORY = "MeshRipple"
 
-    def generate_mesh(self, mesh_ripple_model, points, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, rotation_x, rotation_y, rotation_z, flip_normals):
+    def generate_mesh(self, mesh_ripple_model, points, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
         # Prepare points
         # If points is (B, N, 3/6), take first batch
         if points.ndim == 3:
@@ -242,10 +238,10 @@ class MeshRippleGenerator:
         norm_points[:, :3] = (points[:, :3] - p_center) / p_scale
         norm_points[:, :3] = norm_points[:, :3].clamp(-0.5, 0.5)
         
-        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, rotation_x, rotation_y, rotation_z, flip_normals)
+        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
 
 
-def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, rotation_x=0.0, rotation_y=0.0, rotation_z=0.0, flip_normals=False, pbar=None):
+def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, pbar=None):
     model = mesh_ripple_model["model"]
     config = mesh_ripple_model["config"]
     token_map = mesh_ripple_model["token_map"]
@@ -265,7 +261,22 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
         padding = torch.zeros((target_pc_num - current_pc_num, 6), device=norm_points.device)
         norm_points = torch.cat([norm_points, padding], dim=0)
         
-    pc = norm_points.unsqueeze(0).to(device)
+    pc_np = norm_points.cpu().numpy()
+    
+    # Research code Y-up to Z-up conversion logic (if input is Y-up)
+    if config.data_processing.y_up:
+        # Permute (x, y, z) -> (z, x, y)
+        pc_np_new = pc_np.copy()
+        pc_np_new[:, 0] = pc_np[:, 2] # x_new = z_old
+        pc_np_new[:, 1] = pc_np[:, 0] # y_new = x_old
+        pc_np_new[:, 2] = pc_np[:, 1] # z_new = y_old (up)
+        
+        pc_np_new[:, 3] = pc_np[:, 5] # nx_new = nz_old
+        pc_np_new[:, 4] = pc_np[:, 3] # ny_new = nx_old
+        pc_np_new[:, 5] = pc_np[:, 4] # nz_new = ny_old
+        pc_np = pc_np_new
+        
+    pc = torch.from_numpy(pc_np).unsqueeze(0).to(device)
     batch_size = 1
     
     s_token = token_map['s'].to(device=device, dtype=torch.long)
@@ -287,8 +298,8 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     # Initialize ComfyUI progress bar
     pbar = comfy.utils.ProgressBar(max_faces)
     
-    # Effective max len
-    max_seq_len = min(max_faces, config.data_processing.max_len) * 9
+    # Effective max len dynamically grows to max_faces without being clamped
+    max_seq_len = max_faces * 9
     accelerator = MockAccelerator()
     
     with torch.no_grad():
@@ -376,27 +387,14 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     
     # Undiscretize
     all_vertices = undiscretize_tensor(all_vertices, num_discrete=config.data_processing.n_discrete_size)
-    # Fix vertex permutation to properly reverse ZYX: [0, 1, 2] keeps model's training order (upright + correct normals)
-    all_vertices = all_vertices[:, [0, 1, 2]]
+    # Research code output permutation: [1, 2, 0]
+    all_vertices = all_vertices[:, [1, 2, 0]]
     
     unique_vertices, inverse_indices = torch.unique(all_vertices, sorted=False, dim=0, return_inverse=True)
     faces_indices = inverse_indices.view(-1, 3).cpu().numpy()
     
-    # Flip normals if requested
-    if flip_normals:
-        faces_indices = faces_indices[:, [0, 2, 1]]
-    
     # Create trimesh object
     mesh = trimesh.Trimesh(vertices=unique_vertices.cpu().numpy(), faces=faces_indices)
-    
-    # Apply manual rotations if specified
-    if rotation_x != 0 or rotation_y != 0 or rotation_z != 0:
-        import math
-        rx = math.radians(rotation_x)
-        ry = math.radians(rotation_y)
-        rz = math.radians(rotation_z)
-        transform = trimesh.transformations.euler_matrix(rx, ry, rz)
-        mesh.apply_transform(transform)
         
     return (mesh,)
 

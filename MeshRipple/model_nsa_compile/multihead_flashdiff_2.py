@@ -289,6 +289,16 @@ class MultiheadCrossFlashrope(nn.Module):
                 end = start + q_len
                 if q_len in [4500, 1500, 500]:
                     start = end-1
+                if end > self.k_cache.size(1):
+                    # dynamically expand the cache to prevent out of bounds
+                    expand_size = max(self.k_cache.size(1) * 2, end + 2000)
+                    new_k = torch.zeros(self.k_cache.size(0), expand_size, self.k_cache.size(2), self.k_cache.size(3), dtype=self.k_cache.dtype, device=self.k_cache.device)
+                    new_v = torch.zeros(self.v_cache.size(0), expand_size, self.v_cache.size(2), self.v_cache.size(3), dtype=self.v_cache.dtype, device=self.v_cache.device)
+                    new_k[:, :self.k_cache.size(1), :, :] = self.k_cache
+                    new_v[:, :self.v_cache.size(1), :, :] = self.v_cache
+                    self.k_cache = new_k
+                    self.v_cache = new_v
+                
                 input_pos_index = torch.arange(0, end, dtype=torch.long, device=self.v_cache.device) 
                 self.k_cache[:, start: end, :, :] = k
                 self.v_cache[:, start: end, :, :] = v
