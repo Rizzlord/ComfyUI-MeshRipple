@@ -1028,7 +1028,7 @@ class FaceBoundary(nn.Module):
             
             for i in generate_tqdm:
                 if (i + 1) % 9 == 0:
-                    current_face = (generated.size(1) + i + 1) // 9
+                    current_face = (input_len + i + 1) // 9
                     generate_tqdm.set_description(f"Generating Face {current_face}/{max_faces}")
                     if pbar is not None:
                         pbar.update_absolute(current_face, max_faces)
