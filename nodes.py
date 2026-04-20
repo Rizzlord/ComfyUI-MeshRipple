@@ -19,7 +19,7 @@ except ImportError:
         return None
     models_dir = os.path.join(EXTENSION_DIR, "models")
 
-from huggingface_hub import hf_hub_download
+
 
 if MESH_RIPPLE_PATH not in sys.path:
     sys.path.append(MESH_RIPPLE_PATH)
@@ -31,10 +31,6 @@ from model_compile.transformer import FaceBoundary
 from model_nsa_compile.transformer_nsa import NSAFaceBoundary
 from ripple_tokenizer.tokenizer import undiscretize_tensor
 from ripple_utils.data_process import process_predictions
-
-# Michelangelo Imports
-from michelangelo.utils.misc import get_config_from_file, instantiate_from_config
-from michelangelo.models.tsal.inference_utils import extract_geometry
 
 class MockAccelerator:
     def __init__(self):
@@ -71,264 +67,7 @@ class SimpleMesh:
     def __contains__(self, key):
         return key in ["vertices", "faces"]
 
-def download_miche_model():
-    miche_dir = os.path.join(models_dir, "miche")
-    os.makedirs(miche_dir, exist_ok=True)
-    
-    ckpt_path = os.path.join(miche_dir, "shapevae-256.ckpt")
-    config_path = os.path.join(miche_dir, "shapevae-256.yaml")
-    
-    repo_id = "Maikou/Michelangelo"
-    
-    if not os.path.exists(config_path):
-        print(f"Downloading Miche config to {config_path}...")
-        hf_hub_download(repo_id=repo_id, filename="configs/aligned_shape_latents/shapevae-256.yaml", local_dir=miche_dir, local_dir_use_symlinks=False)
-        # Move it to the flat miche_dir if it was downloaded into a subfolder
-        downloaded_path = os.path.join(miche_dir, "configs/aligned_shape_latents/shapevae-256.yaml")
-        if os.path.exists(downloaded_path):
-            os.rename(downloaded_path, config_path)
-        
-    if not os.path.exists(ckpt_path):
-        print(f"Downloading Miche checkpoint to {ckpt_path}...")
-        hf_hub_download(repo_id=repo_id, filename="checkpoints/aligned_shape_latents/shapevae-256.ckpt", local_dir=miche_dir, local_dir_use_symlinks=False)
-        # Move it to the flat miche_dir if it was downloaded into a subfolder
-        downloaded_path = os.path.join(miche_dir, "checkpoints/aligned_shape_latents/shapevae-256.ckpt")
-        if os.path.exists(downloaded_path):
-            os.rename(downloaded_path, ckpt_path)
-    
-    return ckpt_path, config_path
 
-def find_trellis2():
-    custom_nodes_dir = os.path.dirname(EXTENSION_DIR)
-    # Common directory names for Trellis2
-    possible_names = ["ComfyUI-Trellis2", "ComfyUI-Trellis", "trellis2", "trellis"]
-    
-    for name in possible_names:
-        path = os.path.join(custom_nodes_dir, name)
-        if os.path.exists(path):
-            return path
-            
-    # Fallback: scan all directories for a trellis-like name
-    if os.path.exists(custom_nodes_dir):
-        for d in os.listdir(custom_nodes_dir):
-            if "trellis" in d.lower():
-                return os.path.join(custom_nodes_dir, d)
-    return None
-
-def import_trellis2():
-    trellis2_path = find_trellis2()
-    if not trellis2_path:
-        return None, None
-    
-    if trellis2_path not in sys.path:
-        sys.path.append(trellis2_path)
-        
-    try:
-        from trellis2.pipelines import Trellis2ImageTo3DPipeline
-        from trellis2.representations import MeshWithVoxel
-        return Trellis2ImageTo3DPipeline, MeshWithVoxel
-    except ImportError:
-        return None, None
-
-class Img2PointT2:
-    _pipeline_cache = {}
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "seed": ("INT", {"default": 1337, "min": 0, "max": 0x7fffffff}),
-                "shape_resolution": ([512, 1024], {"default": 512}),
-                "cascade_resolution": ([512, 1024, 1536, 2048, 2560, 3072, 3584, 4096], {"default": 1024}),
-                "reconstruct_with_quad": ("BOOLEAN", {"default": True}),
-                "remesh_resolution": ([128, 256, 512, 1024, 2048], {"default": 512}),
-                "simplification_method": (["none", "cumesh", "meshlib"], {"default": "none"}),
-                "simplification_target": ("INT", {"default": 50000, "min": 1000, "max": 1000000, "step": 1000}),
-                "fill_holes_with_meshlib": ("BOOLEAN", {"default": True}),
-                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536, "tooltip": "Number of points to sample from the final mesh. 16,384 is the default for MeshRipple."}),
-            }
-        }
-
-    RETURN_TYPES = ("POINTS", "TRIMESH",)
-    RETURN_NAMES = ("points", "trimesh",)
-    FUNCTION = "generate"
-    CATEGORY = "MeshRipple"
-
-    def generate(self, image, seed, shape_resolution, cascade_resolution, reconstruct_with_quad, remesh_resolution, simplification_method, simplification_target, fill_holes_with_meshlib, sample_points):
-        T2Pipeline, T2MeshWithVoxel = import_trellis2()
-        if not T2Pipeline:
-            raise Exception("Trellis2 not found. Please install trellis2 comfyui nodes.")
-
-        # Cache the pipeline to avoid reloading weights
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_id = "microsoft/TRELLIS.2-4B"
-        
-        if model_id not in self._pipeline_cache:
-            print(f"Loading Trellis2 model: {model_id}...")
-            # Using defaults from the high-quality workflow
-            pipe = T2Pipeline.from_pretrained(model_id, keep_models_loaded=True)
-            pipe.to(device)
-            self._pipeline_cache[model_id] = pipe
-        
-        pipeline = self._pipeline_cache[model_id]
-
-        # Convert IMAGE tensor (B, H, W, C) to PIL
-        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
-        pil_img = Image.fromarray(img_np)
-
-        # Settings from trellis2meshgen.json
-        sampler_params = {
-            "steps": 12,
-            "guidance_strength": 7.5,
-            "guidance_rescale": 0.01,
-            "rescale_t": 4.0
-        }
-
-        # Resolve Trellis2 internals
-        from trellis2.pipelines.trellis2_image_to_3d import seed_all
-        seed_all(seed)
-        
-        # Convert IMAGE tensor (B, H, W, C) to PIL List
-        # ComfyUI: [batch_index, h, w, c]
-        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
-        pil_images = [Image.fromarray(img_np)]
-        image_in = pil_images[0] if len(pil_images) == 1 else pil_images
-
-        # Progress Setup
-        from comfy.utils import ProgressBar
-        pbar = ProgressBar(6)
-
-        print(f"Executing manual Trellis2 pipeline (Shape: {shape_resolution}, Cascade: {cascade_resolution}, Seed: {seed})...")
-        
-        # 1. Image Conditioning
-        pipeline.load_image_cond_model()
-        cond_512 = pipeline.get_cond(pil_images, 512, max_views=4)
-        cond_target = pipeline.get_cond(pil_images, shape_resolution, max_views=4) if shape_resolution != 512 else cond_512
-        pbar.update(1)
-        if not pipeline.keep_models_loaded: pipeline.unload_image_cond_model()
-
-        # 2. Sparse Structure
-        pipeline.load_sparse_structure_model()
-        coords = pipeline.sample_sparse_structure(
-            cond_512, 32, # sparse_structure_resolution default
-            1, sampler_params,
-            fill_holes=True,
-            keep_only_shell=True
-        )
-        pbar.update(1)
-        if not pipeline.keep_models_loaded: pipeline.unload_sparse_structure_model()
-
-        # 3. Shape Slat Cascade
-        pipeline.load_shape_slat_flow_model_512()
-        pipeline.load_shape_slat_flow_model_1024()
-        
-        # Use advanced cascade sampler to support requested resolutions
-        if cascade_resolution == 512 and shape_resolution == 512:
-            # Single stage 512
-            from trellis2.modules.sparse.basic import SparseTensor
-            noise = SparseTensor(
-                feats=torch.randn(coords.shape[0], pipeline.models['shape_slat_flow_model_512'].in_channels, device=device),
-                coords=coords.to(device)
-            )
-            shape_slat = pipeline.shape_slat_sampler.sample(
-                pipeline.models['shape_slat_flow_model_512'], noise, **cond_512, **sampler_params
-            ).samples
-            res = 512
-        else:
-            # Multi-stage cascade
-            shape_slat, res = pipeline.sample_shape_slat_cascade_advanced(
-                cond_512, cond_target,
-                pipeline.models['shape_slat_flow_model_512'], 
-                pipeline.models['shape_slat_flow_model_1024'],
-                512, cascade_resolution,
-                coords, sampler_params, sampler_params
-            )
-        pbar.update(1)
-        
-        if not pipeline.keep_models_loaded:
-            pipeline.unload_shape_slat_flow_model_512()
-            pipeline.unload_shape_slat_flow_model_1024()
-
-        # 4. Decode
-        torch.cuda.empty_cache()
-        meshes = pipeline.decode_latent(shape_slat, None, res, use_tiled=True)
-        mesh = meshes[0]
-        pbar.update(1)
-        
-        # Optional Quad Remesh
-        if reconstruct_with_quad:
-            import cumesh
-            print(f"Reconstructing mesh with quad (Resolution: {remesh_resolution})...")
-            # DC Quad remeshing builds better topology for point sampling
-            new_verts, new_faces = cumesh.remeshing.reconstruct_mesh_dc_quad(
-                mesh.vertices.cuda(), 
-                mesh.faces.cuda(), 
-                remesh_resolution, 
-                verbose=True
-            )
-            mesh.vertices = new_verts.cpu()
-            mesh.faces = new_faces.cpu()
-        
-        # 5. Advanced Post-Processing
-        # Optional Hole Filling (Meshlib)
-        if fill_holes_with_meshlib:
-            try:
-                import meshlib.mrmeshnumpy as mrmeshnumpy
-                import meshlib.mrmeshpy as mrmeshpy
-                import copy
-                import gc
-                
-                print("Filling holes with Meshlib...")
-                mr_mesh = mrmeshnumpy.meshFromFacesVerts(mesh.faces.cpu().numpy(), mesh.vertices.cpu().numpy())
-                hole_edges = mr_mesh.topology.findHoleRepresentiveEdges()
-                if len(hole_edges) > 0:
-                    for e in hole_edges:
-                        params = mrmeshpy.FillHoleParams()
-                        params.metric = mrmeshpy.getUniversalMetric(mr_mesh)
-                        mrmeshpy.fillHole(mr_mesh, e, params)
-                    
-                    new_vertices = mrmeshnumpy.getNumpyVerts(mr_mesh)
-                    new_faces = mrmeshnumpy.getNumpyFaces(mr_mesh.topology)
-                    mesh.vertices = torch.from_numpy(new_vertices).float().to(mesh.device)
-                    mesh.faces = torch.from_numpy(new_faces).int().to(mesh.device)
-                
-                del mr_mesh
-                gc.collect()
-            except ImportError:
-                print("Meshlib not found, skipping hole filling.")
-
-        # Optional Simplification
-        if simplification_method == "cumesh":
-            print(f"Simplifying mesh with Cumesh (Target: {simplification_target})...")
-            mesh.simplify_with_cumesh(target=simplification_target)
-        elif simplification_method == "meshlib":
-            try:
-                print(f"Simplifying mesh with Meshlib (Target: {simplification_target})...")
-                mesh.simplify_with_meshlib(target=simplification_target)
-            except ImportError:
-                print("Meshlib not found, skipping simplification.")
-
-        pbar.update(1)
-
-        # 6. Sample Points from FINAL PROCESSED mesh
-        import trimesh as tm_module
-        # Use trimesh for sampling as it's more robust on decimated/cleaned meshes
-        tm = tm_module.Trimesh(vertices=mesh.vertices.cpu().numpy(), faces=mesh.faces.cpu().numpy())
-        
-        print(f"Sampling {sample_points} points from final processed mesh...")
-        # Use simple barycentric sampling on trimesh
-        points, face_indices = tm_module.sample.sample_surface(tm, sample_points)
-        sampled_normals = tm.face_normals[face_indices]
-        
-        points_tensor = torch.from_numpy(points).float()
-        normals_tensor = torch.from_numpy(sampled_normals).float()
-
-        # Combine to (N, 6)
-        pc_normal = torch.cat([points_tensor, normals_tensor], dim=1) # (N, 6)
-        pbar.update(1)
-        
-        return (pc_normal.unsqueeze(0), tm)
 
 class TrimeshToPoints:
     @classmethod
@@ -363,111 +102,6 @@ class TrimeshToPoints:
         
         return (pc_normal.unsqueeze(0),) # (1, N, 6)
 
-class MichelangeloModelLoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        miche_dir = os.path.join(models_dir, "miche")
-        os.makedirs(miche_dir, exist_ok=True)
-        files = [f for f in os.listdir(miche_dir) if f.endswith(".ckpt")]
-        return {
-            "required": {
-                "model_name": (files,),
-            }
-        }
-    
-    RETURN_TYPES = ("MICHE_MODEL",)
-    FUNCTION = "load_model"
-    CATEGORY = "MeshRipple/Michelangelo"
-
-    def load_model(self, model_name):
-        ckpt_path = os.path.join(models_dir, "miche", model_name)
-        config_path = ckpt_path.replace(".ckpt", ".yaml")
-        
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config file not found for model: {model_name}")
-            
-        model_config = get_config_from_file(config_path)
-        if hasattr(model_config, "model"):
-            model_config = model_config.model
-
-        print(f"Loading Michelangelo model from {ckpt_path}...")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = instantiate_from_config(model_config, ckpt_path=ckpt_path)
-        model.to(device).eval()
-        
-        return ({"model": model, "config": model_config, "device": device},)
-
-class MichelangeloImageToPoints:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "miche_model": ("MICHE_MODEL",),
-                "image": ("IMAGE",),
-                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 0.0, "max": 20.0, "step": 0.1}),
-                "num_steps": ("INT", {"default": 50, "min": 1, "max": 200}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536}),
-            }
-        }
-    
-    RETURN_TYPES = ("POINTS",)
-    FUNCTION = "generate_points"
-    CATEGORY = "MeshRipple/Michelangelo"
-
-    def generate_points(self, miche_model, image, guidance_scale, num_steps, seed, sample_points):
-        model = miche_model["model"]
-        device = miche_model["device"]
-        
-        torch.manual_seed(seed)
-        
-        # Preprocess image
-        # image is (B, H, W, C), range [0, 1]
-        img = image[0].cpu().numpy()
-        img = (img * 255).astype(np.uint8)
-        img = Image.fromarray(img).convert("RGB")
-        img = img.resize((224, 224), Image.LANCZOS)
-        
-        img_np = np.array(img).astype(np.float32) / 255.0
-        img_np = img_np * 2.0 - 1.0  # Normalize to [-1, 1]
-        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
-        
-        sample_inputs = {"image": img_tensor}
-        
-        print(f"Sampling 3D shape from image with guidance_scale={guidance_scale}...")
-        # Check if the model is the diffuser or just the VAE
-        if hasattr(model, "sample"):
-            # It's the diffuser
-            mesh_outputs = model.sample(
-                sample_inputs,
-                sample_times=1,
-                steps=num_steps,
-                guidance_scale=guidance_scale,
-                bounds=[-1.1, -1.1, -1.1, 1.1, 1.1, 1.1],
-                octree_depth=7
-            )[0]
-        else:
-            # It's likely just the VAE, try to encode/decode (though this node is for image generation)
-            raise ValueError("The loaded Michelangelo model does not support sampling (it is likely a VAE, not a Diffuser). Please load an 'image-ASLDM' model.")
-
-        # Extract mesh from the first output
-        mesh_out = mesh_outputs[0]
-        if mesh_out is None:
-            raise ValueError("Michelangelo failed to generate a surface for this image.")
-            
-        # Michelangelo mesh faces are often inverted for some reason in their inference.py
-        faces = mesh_out.mesh_f[:, ::-1]
-        tm_mesh = trimesh.Trimesh(mesh_out.mesh_v, faces, process=False)
-        
-        # Sample points and normals
-        sampled_points, face_idx = tm_mesh.sample(sample_points, return_index=True)
-        normals = tm_mesh.face_normals[face_idx]
-        
-        points_6d = np.concatenate([sampled_points, normals], axis=-1).astype(np.float32)
-        points_tensor = torch.from_numpy(points_6d).unsqueeze(0) # (1, N, 6)
-        
-        return (points_tensor,)
 
 class MeshRippleModelLoader:
     @classmethod
@@ -516,8 +150,6 @@ class MeshRippleModelLoader:
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Ensure Miche model is available (fallback)
-        download_miche_model()
         
         if config.model.model_version == "full_attn":
             model = FaceBoundary(
@@ -618,71 +250,6 @@ class MeshRippleGenerator:
         
         return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
 
-class MeshRippleRemesh:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "mesh_ripple_model": ("MESH_RIPPLE_MODEL",),
-                "mesh": ("*", {"forceInput": True, "tooltip": "Input mesh to be remeshed."}),
-                "sample_points": ("INT", {"default": 16384, "min": 1024, "max": 65536, "tooltip": "Number of points to sample from input mesh for conditioning."}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Random seed."}),
-                "top_k": ("INT", {"default": 50, "min": 1, "max": 100, "tooltip": "Sampling top K tokens."}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "tooltip": "Nucleus sampling threshold."}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0, "tooltip": "Randomness control."}),
-                "max_faces": ("INT", {"default": 5000, "min": 100, "max": 20000, "tooltip": "Face generation limit."}),
-                "use_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Lossless KV caching for faster generation."}),
-            }
-        }
-    
-    RETURN_TYPES = ("MESH",)
-    FUNCTION = "remesh"
-    CATEGORY = "MeshRipple"
-
-    def remesh(self, mesh_ripple_model, mesh, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
-        # Convert input to trimesh
-        # Handle dictionary format (ComfyUI standard)
-        if isinstance(mesh, dict) and "vertices" in mesh and "faces" in mesh:
-            vertices = mesh["vertices"][0].cpu().numpy()
-            faces = mesh["faces"][0].cpu().numpy()
-            tm_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        # Handle raw trimesh object (common in some 3D extensions)
-        elif hasattr(mesh, "vertices") and hasattr(mesh, "faces") and not isinstance(mesh, dict):
-            # It's likely already a trimesh-like object
-            # We normalize its scale/center later anyway
-            vertices = np.array(mesh.vertices)
-            faces = np.array(mesh.faces)
-            tm_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        else:
-            # Final fallback: try to see if it's some other object with vertices/faces
-            try:
-                vertices = np.array(mesh.vertices)
-                faces = np.array(mesh.faces)
-                tm_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-            except:
-                raise ValueError(f"Unsupported mesh format: {type(mesh)}. Expected ComfyUI dictionary or Trimesh object.")
-        
-        # Normalize mesh to [-0.5, 0.5] locally first for better sampling or just sample raw
-        # The model logic expects normalized points, so we'll normalize our sampled points.
-        
-        # Sample points and normals
-        # Using logic similar to MeshDataset_infer.sample_pc
-        points, face_idx = tm_mesh.sample(sample_points, return_index=True)
-        normals = tm_mesh.face_normals[face_idx]
-        
-        points_norm = np.concatenate([points, normals], axis=-1).astype(np.float32)
-        norm_points_tensor = torch.from_numpy(points_norm)
-        
-        # Shift and scale to [-0.5, 0.5]
-        p_min = norm_points_tensor[:, :3].min(dim=0)[0]
-        p_max = norm_points_tensor[:, :3].max(dim=0)[0]
-        p_center = (p_min + p_max) / 2
-        p_scale = (p_max - p_min).max()
-        
-        norm_points_tensor[:, :3] = (norm_points_tensor[:, :3] - p_center) / p_scale
-        norm_points_tensor[:, :3] = norm_points_tensor[:, :3].clamp(-0.5, 0.5)
-        
-        return common_generate(mesh_ripple_model, norm_points_tensor, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
 
 def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
     model = mesh_ripple_model["model"]
@@ -818,19 +385,11 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
 NODE_CLASS_MAPPINGS = {
     "MeshRippleModelLoader": MeshRippleModelLoader,
     "MeshRippleGenerator": MeshRippleGenerator,
-    "MeshRippleRemesh": MeshRippleRemesh,
-    "MichelangeloModelLoader": MichelangeloModelLoader,
-    "MichelangeloImageToPoints": MichelangeloImageToPoints,
-    "Img2PointT2": Img2PointT2,
     "TrimeshToPoints": TrimeshToPoints,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MeshRippleModelLoader": "MeshRipple Model Loader",
     "MeshRippleGenerator": "MeshRipple Generator",
-    "MeshRippleRemesh": "MeshRipple Remesh",
-    "MichelangeloModelLoader": "Michelangelo Model Loader",
-    "MichelangeloImageToPoints": "Michelangelo Image to Points",
-    "Img2PointT2": "Trellis2 Image to Points",
     "TrimeshToPoints": "Trimesh to Points (16k)",
 }

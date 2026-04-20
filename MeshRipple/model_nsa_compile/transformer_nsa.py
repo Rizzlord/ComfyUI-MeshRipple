@@ -416,7 +416,7 @@ class NSAFaceBoundary(nn.Module):
         self.factor = [3, 3]
         self.norm = RMSNorm(embed_dim, eps=1e-5)
 
-    def forward(self, x, context, pc, token_len, boundary_mask, cross_mask, start, input_root=None):
+    def forward(self, x, context, pc=None, token_len=None, boundary_mask=None, cross_mask=None, start=None, input_root=None, conds=None):
         assert torch.all(start % 9 == 0), "hourglass start must be divided by 9"
         if x.shape[1] % 9 != 0:
             x = pad_to_multiple(x, 9, 1)
@@ -429,12 +429,8 @@ class NSAFaceBoundary(nn.Module):
         bottle_start = start // 9
         x = self.norm(x)
         encoder_outputs = []
-        if pc is not None and self.conditioned_on_pc:
+        if conds is None and pc is not None and self.conditioned_on_pc:
             conds = self.conditioner(pc)  # b,257,1024
-            # token_len_embed = self.token_len_conditioner(token_len).unsqueeze(1)
-            # conds = torch.cat([conds, token_len_embed.expand(-1, conds.shape[1], -1)], dim=-1)
-        else:
-            conds = None
         # Compression stage
         for scale in range(self.depth):
             for block in self.encoder_blocks[scale]:
@@ -1022,22 +1018,29 @@ class NSAFaceBoundary(nn.Module):
         }
         total_predict = []
         wrong_data = [[] for _ in range(batch_size)]
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             if pc is not None and self.conditioned_on_pc:
                 conds = self.conditioner(pc)
             else:
                 conds = None  
             if use_kv_cache:
                 # First forward pass with the entire initial sequence
-                with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
-                    output, class_next = self._process_first_tokens(
-                                generated, 
-                                generated_context, 
-                                generated_attention_mask, 
-                                start, 
-                                conds=conds)
+                output, class_next = self._process_first_tokens(
+                            generated, 
+                            generated_context, 
+                            generated_attention_mask, 
+                            start, 
+                            conds=conds)
             else:
-                output, class_next = self.forward(generated, generated_context, generated_attention_mask, None, start, conds=conds)
+                output, class_next = self.forward(
+                            generated, 
+                            generated_context, 
+                            pc=None, 
+                            token_len=None, 
+                            boundary_mask=generated_attention_mask, 
+                            cross_mask=None, 
+                            start=start, 
+                            conds=conds)
 
             start += generated.shape[1]
 
@@ -1192,7 +1195,14 @@ class NSAFaceBoundary(nn.Module):
                                         start, 
                                         conds=conds)
                 else:
-                    output, class_next = self.forward(generated, generated_context, total_attention_mask[:,:start[0]//9+1,:start[0]//9+1], None, torch.zeros_like(start), conds=conds)
+                    output, class_next = self.forward(
+                        generated, 
+                        generated_context, 
+                        pc=None, 
+                        boundary_mask=total_attention_mask[:, :start[0] // 9 + 1, :start[0] // 9 + 1], 
+                        start=torch.zeros_like(start), 
+                        conds=conds
+                    )
 
                 start = start + 1
         # Reset cache after generation

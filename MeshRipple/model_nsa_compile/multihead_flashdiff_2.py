@@ -144,6 +144,8 @@ class MultiheadFlashrope(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
         if mask is not None:
             atten_mask_npu = mask.unsqueeze(1).expand(b, head_num, seq_q, seq_k)
             atten_mask_npu = torch.logical_not(atten_mask_npu)
@@ -318,6 +320,8 @@ class MultiheadCrossFlashrope(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
         if mask is not None:
             atten_mask_npu = mask.unsqueeze(1).expand(b, head_num, seq_q, seq_k)
             atten_mask_npu = torch.logical_not(atten_mask_npu)
@@ -449,6 +453,8 @@ class CrossAttention(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
         if mask is not None:
             atten_mask_npu = mask.unsqueeze(1).expand(b, head_num, seq_q, seq_k)
             atten_mask_npu = torch.logical_not(atten_mask_npu)
