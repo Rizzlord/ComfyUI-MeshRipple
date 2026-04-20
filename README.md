@@ -22,7 +22,9 @@ A ComfyUI implementation of **MeshRipple**, a powerful autoregressive model for 
 
 ## Model Setup
 
-You need to place the following models in your ComfyUI models directory:
+This repository is a **ComfyUI port** of the original [MeshRipple](https://github.com/MayMhappy/MeshRipple) project.
+
+You can download the required checkpoints from this **[Google Drive Folder](https://drive.google.com/drive/folders/1qex2gbIoxh4-qRbAUYxIF5b_OwvLhOxq)**.
 
 ### MeshRipple Weights
 Place these in `ComfyUI/models/meshripple/`:
@@ -56,4 +58,4 @@ A utility node to convert a standard `TRIMESH` object into a sampled point cloud
 MeshRipple represents meshes as a sequence of triangles. The model predicts the vertices of each face in an autoregressive manner, conditioned on a point cloud features extracted by the Michelangelo encoder.
 
 ## Acknowledgments
-This node is based on the [MeshRipple](https://github.com/Zheng-Zhiyuan/MeshRipple) research project and incorporates encoders from [Michelangelo](https://github.com/Bytedance/Michelangelo).
+This node is a ComfyUI port based on the awesome work of [MeshRipple](https://github.com/MayMhappy/MeshRipple) and incorporates encoders from [Michelangelo](https://github.com/Bytedance/Michelangelo).
