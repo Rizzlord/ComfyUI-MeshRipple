@@ -54,19 +54,6 @@ class DictToObject:
             else:
                 setattr(self, key, value)
 
-class SimpleMesh:
-    def __init__(self, vertices, faces):
-        self.vertices = vertices
-        self.faces = faces
-    def __getitem__(self, key):
-        if key == "vertices": return self.vertices
-        if key == "faces": return self.faces
-        raise KeyError(key)
-    def keys(self):
-        return ["vertices", "faces"]
-    def __contains__(self, key):
-        return key in ["vertices", "faces"]
-
 
 
 class TrimeshToPoints:
@@ -208,7 +195,8 @@ class MeshRippleGenerator:
             }
         }
     
-    RETURN_TYPES = ("MESH",)
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
     FUNCTION = "generate_mesh"
     CATEGORY = "MeshRipple"
 
@@ -380,7 +368,8 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     unique_vertices, inverse_indices = torch.unique(all_vertices, sorted=False, dim=0, return_inverse=True)
     faces_indices = inverse_indices.view(-1, 3)
     
-    return (SimpleMesh(unique_vertices.unsqueeze(0), faces_indices.unsqueeze(0)),)
+    mesh = trimesh.Trimesh(vertices=unique_vertices.cpu().numpy(), faces=faces_indices.cpu().numpy())
+    return (mesh,)
 
 NODE_CLASS_MAPPINGS = {
     "MeshRippleModelLoader": MeshRippleModelLoader,
