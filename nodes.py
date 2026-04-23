@@ -398,14 +398,84 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
         
     return (mesh,)
 
+
+class MeshHoleSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+                "sample_points": ("INT", {"default": 16384, "min": 1, "max": 65536}),
+            }
+        }
+
+    RETURN_TYPES = ("POINTS",)
+    RETURN_NAMES = ("points",)
+    FUNCTION = "sample"
+    CATEGORY = "MeshRipple"
+
+    def sample(self, trimesh, sample_points):
+        import trimesh as tm
+        import torch
+        
+        mesh_copy = trimesh.copy()
+        original_faces_count = len(mesh_copy.faces)
+        
+        tm.repair.fill_holes(mesh_copy)
+        
+        new_faces_count = len(mesh_copy.faces)
+        
+        if new_faces_count <= original_faces_count:
+            print("No holes detected in the mesh.")
+            return (torch.zeros((1, 1, 6)),)
+            
+        patch_faces = mesh_copy.faces[original_faces_count:]
+        patch_mesh = tm.Trimesh(vertices=mesh_copy.vertices, faces=patch_faces)
+        
+        points, face_indices = tm.sample.sample_surface(patch_mesh, sample_points)
+        normals = patch_mesh.face_normals[face_indices]
+        
+        points_tensor = torch.from_numpy(points).float()
+        normals_tensor = torch.from_numpy(normals).float()
+        
+        pc_normal = torch.cat([points_tensor, normals_tensor], dim=1)
+        
+        return (pc_normal.unsqueeze(0),)
+
+
+class MeshMerge:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh_1": ("TRIMESH",),
+                "mesh_2": ("TRIMESH",),
+            }
+        }
+
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
+    FUNCTION = "merge"
+    CATEGORY = "MeshRipple"
+
+    def merge(self, mesh_1, mesh_2):
+        import trimesh as tm
+        merged_mesh = tm.util.concatenate([mesh_1, mesh_2])
+        return (merged_mesh,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MeshRippleModelLoader": MeshRippleModelLoader,
     "MeshRippleGenerator": MeshRippleGenerator,
     "TrimeshToPoints": TrimeshToPoints,
+    "MeshHoleSampler": MeshHoleSampler,
+    "MeshMerge": MeshMerge,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MeshRippleModelLoader": "MeshRipple Model Loader",
     "MeshRippleGenerator": "MeshRipple Generator",
     "TrimeshToPoints": "Trimesh to Points (16k)",
+    "MeshHoleSampler": "Mesh Hole Sampler",
+    "MeshMerge": "Mesh Merge",
 }
