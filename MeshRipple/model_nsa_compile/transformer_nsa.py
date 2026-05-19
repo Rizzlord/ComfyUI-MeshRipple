@@ -989,6 +989,9 @@ class NSAFaceBoundary(nn.Module):
         root_connect_constrain = True,
         wr_fix = True,
         use_kv_cache = True,
+        max_faces=5000,
+        pbar=None,
+        callback=None
     ):
         """
         Generate sequence using the same interface as the original generate_sequence function
@@ -1049,13 +1052,17 @@ class NSAFaceBoundary(nn.Module):
             # Store the most recent 100 steps in a list (1 means wrong/corrected, 0 means correct)
             batch_recent_errors = [[] for _ in range(batch_size)]
 
-            # Then generate one token at a time
             generate_tqdm = tqdm(
                 range(max_seq_len - generated.size(1)),
-                desc=f"Generate input_len {input_len}",
+                desc=f"Generating Faces (Max {max_faces})",
                 disable=not accelerator.is_local_main_process
             )
-            for _ in generate_tqdm:
+            for i in generate_tqdm:
+                if (i + 1) % 9 == 0:
+                    current_face = (input_len + i + 1) // 9
+                    generate_tqdm.set_description(f"Generating Face {current_face}/{max_faces}")
+                    if pbar is not None:
+                        pbar.update_absolute(current_face, max_faces)
                 if eos_mask.all():
                     break
 
@@ -1157,6 +1164,8 @@ class NSAFaceBoundary(nn.Module):
                             token_map
                         )
                     generated_context = torch.cat([generated_context, generated[:,-9:].reshape([generated.shape[0],1,9])], dim=1)
+                    if callback is not None:
+                        callback(generated, token_map)
                     
                 if (start[0]) % 9 == 0:
                     

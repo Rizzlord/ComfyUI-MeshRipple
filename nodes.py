@@ -34,6 +34,53 @@ from model_nsa_compile.transformer_nsa import NSAFaceBoundary
 from ripple_tokenizer.tokenizer import undiscretize_tensor
 from ripple_utils.data_process import process_predictions
 
+def make_progress_callback(unique_id, config):
+    from server import PromptServer
+    if PromptServer.instance is None:
+        return None
+    node_str = str(unique_id[0]) if isinstance(unique_id, list) else str(unique_id)
+    def callback(generated, token_map):
+        try:
+            pred_token = generated[:, 9:]
+            pred_token_unflatten = pred_token.view(pred_token.shape[0], -1, 9)
+            eos_id = token_map["eos"].cpu()
+            pad_id = token_map["pad"].cpu()
+            pred_token_unflatten_cpu = pred_token_unflatten.detach().cpu()
+            eos_mask = torch.eq(pred_token_unflatten_cpu, eos_id).any(dim=2)
+            pad_mask = torch.eq(pred_token_unflatten_cpu, pad_id).any(dim=2)
+            stop_mask = eos_mask | pad_mask
+            stop_indices = stop_mask.float().argmax(dim=1)
+            no_stop_token = ~stop_mask.any(dim=1)
+            stop_indices[no_stop_token] = pred_token_unflatten.size(1)
+            lenth = stop_indices[0].item()
+            if lenth == 0:
+                return
+            tokens = pred_token_unflatten[0, :lenth]
+            identifiers = torch.stack([v.detach().cpu() for v in token_map.values()])
+            valid_mask = ~(tokens.unsqueeze(1).cpu() == identifiers).all(dim=2).any(dim=1)
+            valid_indices = torch.where(valid_mask)[0]
+            if len(valid_indices) == 0:
+                return
+            vertices_faces = tokens[valid_indices]
+            if config.data_processing.vertex_order == "zyx":
+                vertices_faces_unflatten = vertices_faces.reshape(vertices_faces.shape[0], 3, 3)[:, :, [2,1,0]]
+                vertices_faces = vertices_faces_unflatten.reshape(vertices_faces.shape[0], 9)
+            faces_coords = vertices_faces.reshape([vertices_faces.shape[0], 3, 3])
+            all_vertices = faces_coords.reshape([faces_coords.shape[0] * 3, 3])
+            all_vertices = undiscretize_tensor(all_vertices, num_discrete=config.data_processing.n_discrete_size)
+            all_vertices = all_vertices[:, [1, 2, 0]]
+            unique_vertices, inverse_indices = torch.unique(all_vertices, sorted=False, dim=0, return_inverse=True)
+            faces_indices = inverse_indices.view(-1, 3).cpu().numpy()
+            PromptServer.instance.send_sync("meshripple_preview", {
+                "node_id": node_str,
+                "vertices": unique_vertices.cpu().numpy().tolist(),
+                "faces": faces_indices.tolist()
+            })
+        except Exception:
+            pass
+    return callback
+
+
 class MockAccelerator:
     def __init__(self):
         self.is_local_main_process = True
@@ -194,6 +241,9 @@ class MeshRippleGenerator:
                 "temperature": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 2.0, "tooltip": "Controls randomness. <1.0 is safer/tighter, >1.0 is more experimental."}),
                 "max_faces": ("INT", {"default": 5000, "min": 100, "max": 60000, "tooltip": "Maximum number of faces to generate before auto-stopping."}),
                 "use_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Enables Key-Value caching for massive speedup. This is mathematically lossless."}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
     
@@ -202,7 +252,7 @@ class MeshRippleGenerator:
     FUNCTION = "generate_mesh"
     CATEGORY = "MeshRipple"
 
-    def generate_mesh(self, mesh_ripple_model, points, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache):
+    def generate_mesh(self, mesh_ripple_model, points, sample_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, unique_id=None):
         # Prepare points
         # If points is (B, N, 3/6), take first batch
         if points.ndim == 3:
@@ -238,10 +288,10 @@ class MeshRippleGenerator:
         norm_points[:, :3] = (points[:, :3] - p_center) / p_scale
         norm_points[:, :3] = norm_points[:, :3].clamp(-0.5, 0.5)
         
-        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache)
+        return common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, unique_id=unique_id)
 
 
-def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, pbar=None):
+def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperature, max_faces, use_kv_cache, unique_id=None):
     model = mesh_ripple_model["model"]
     config = mesh_ripple_model["config"]
     token_map = mesh_ripple_model["token_map"]
@@ -302,6 +352,8 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
     max_seq_len = max_faces * 9
     accelerator = MockAccelerator()
     
+    callback = make_progress_callback(unique_id, config) if unique_id is not None else None
+
     with torch.no_grad():
         if config.model.model_version == "full_attn":
             call_kwargs = dict(
@@ -324,7 +376,8 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
                 root_connect_constrain=True,
                 use_kv_cache=use_kv_cache,
                 max_faces=max_faces,
-                pbar=pbar
+                pbar=pbar,
+                callback=callback
             )
         else:
             call_kwargs = dict(
@@ -347,7 +400,8 @@ def common_generate(mesh_ripple_model, norm_points, seed, top_k, top_p, temperat
                 root_connect_constrain=True,
                 use_kv_cache=use_kv_cache,
                 max_faces=max_faces,
-                pbar=pbar
+                pbar=pbar,
+                callback=callback
             )
         
         total_pred_token = model.generate(**call_kwargs)

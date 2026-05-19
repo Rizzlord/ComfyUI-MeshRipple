@@ -958,7 +958,8 @@ class FaceBoundary(nn.Module):
         wr_fix=True,
         use_kv_cache=True,
         max_faces=5000,
-        pbar=None
+        pbar=None,
+        callback=None
     ):
         """
         Generate sequence using the same interface as the original generate_sequence function
@@ -1125,6 +1126,8 @@ class FaceBoundary(nn.Module):
                             token_map
                         )
                     generated_context = torch.cat([generated_context, generated[:,-9:].reshape([generated.shape[0],1,9])], dim=1)
+                    if callback is not None:
+                        callback(generated, token_map)
                     
                 if start[0] % 9 == 0:
                     
