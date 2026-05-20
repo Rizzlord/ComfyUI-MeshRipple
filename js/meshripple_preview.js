@@ -149,45 +149,32 @@ app.registerExtension({
             },
             computeSize() {
                 return [220, widget.height || 220];
+            },
+            mouse(event, pos, nd) {
+                if (event.type === "mousedown" || event.type === "pointerdown") {
+                    this.mouse_dragging = true;
+                    this.last_mouse_pos = [pos[0], pos[1]];
+                    return true;
+                } else if (event.type === "mousemove" || event.type === "pointermove") {
+                    if (this.mouse_dragging) {
+                        const dx = pos[0] - this.last_mouse_pos[0];
+                        const dy = pos[1] - this.last_mouse_pos[1];
+                        nd.mesh_yaw = (nd.mesh_yaw || 0) + dx * 0.01;
+                        nd.mesh_pitch = (nd.mesh_pitch || 0) + dy * 0.01;
+                        this.last_mouse_pos = [pos[0], pos[1]];
+                        nd.setDirtyCanvas(true, true);
+                        return true;
+                    }
+                } else if (event.type === "mouseup" || event.type === "pointerup" || event.type === "pointerout") {
+                    this.mouse_dragging = false;
+                    return true;
+                }
+                return false;
             }
         };
 
         node.addCustomWidget(widget);
         node.setSize([node.size[0] || 240, (node.size[1] || 260) + 240]);
-
-        const oldMouseDown = node.onMouseDown;
-        node.onMouseDown = function(event, pos, canvas) {
-            const w = this.widgets.find(item => item.name === "mesh_preview");
-            if (w && pos[1] >= w.y && pos[1] <= w.y + w.height) {
-                this.mouse_dragging = true;
-                this.last_mouse_pos = [pos[0], pos[1]];
-                return true;
-            }
-            if (oldMouseDown) return oldMouseDown.apply(this, arguments);
-        };
-
-        const oldMouseMove = node.onMouseMove;
-        node.onMouseMove = function(event, pos, canvas) {
-            if (this.mouse_dragging) {
-                const dx = pos[0] - this.last_mouse_pos[0];
-                const dy = pos[1] - this.last_mouse_pos[1];
-                this.mesh_yaw = (this.mesh_yaw || 0) + dx * 0.01;
-                this.mesh_pitch = (this.mesh_pitch || 0) + dy * 0.01;
-                this.last_mouse_pos = [pos[0], pos[1]];
-                this.setDirtyCanvas(true, true);
-                return true;
-            }
-            if (oldMouseMove) return oldMouseMove.apply(this, arguments);
-        };
-
-        const oldMouseUp = node.onMouseUp;
-        node.onMouseUp = function(event, pos, canvas) {
-            if (this.mouse_dragging) {
-                this.mouse_dragging = false;
-                return true;
-            }
-            if (oldMouseUp) return oldMouseUp.apply(this, arguments);
-        };
     }
 });
 
