@@ -36,11 +36,17 @@ from ripple_utils.data_process import process_predictions
 
 def make_progress_callback(unique_id, config):
     from server import PromptServer
+    import time
     if PromptServer.instance is None:
         return None
     node_str = str(unique_id[0]) if isinstance(unique_id, list) else str(unique_id)
+    last_time = [0.0]
     def callback(generated, token_map):
         try:
+            now = time.time()
+            if now - last_time[0] < 5.0:
+                return
+            last_time[0] = now
             pred_token = generated[:, 9:]
             pred_token_unflatten = pred_token.view(pred_token.shape[0], -1, 9)
             eos_id = token_map["eos"].cpu()

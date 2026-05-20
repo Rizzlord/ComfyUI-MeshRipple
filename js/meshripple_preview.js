@@ -8,6 +8,7 @@ app.registerExtension({
 
         node.mesh_yaw = 0.5;
         node.mesh_pitch = 0.3;
+        node.mesh_zoom = 1.0;
         node.mesh_data = null;
 
         const widget = {
@@ -61,7 +62,8 @@ app.registerExtension({
                 const sinP = Math.sin(nd.mesh_pitch);
 
                 const projected = [];
-                const scale = 0.8 * Math.min(widget_width, actual_height) / maxDim;
+                nd.mesh_zoom = nd.mesh_zoom || 1.0;
+                const scale = 0.8 * Math.min(widget_width, actual_height) / maxDim * nd.mesh_zoom;
                 const centerX = widget_width / 2;
                 const centerY = y + actual_height / 2;
 
@@ -159,7 +161,7 @@ app.registerExtension({
                     if (this.mouse_dragging) {
                         const dx = pos[0] - this.last_mouse_pos[0];
                         const dy = pos[1] - this.last_mouse_pos[1];
-                        nd.mesh_yaw = (nd.mesh_yaw || 0) + dx * 0.01;
+                        nd.mesh_yaw = (nd.mesh_yaw || 0) - dx * 0.01;
                         nd.mesh_pitch = (nd.mesh_pitch || 0) + dy * 0.01;
                         this.last_mouse_pos = [pos[0], pos[1]];
                         nd.setDirtyCanvas(true, true);
@@ -175,6 +177,16 @@ app.registerExtension({
 
         node.addCustomWidget(widget);
         node.setSize([node.size[0] || 240, (node.size[1] || 260) + 240]);
+
+        node.onMouseWheel = function(event, pos, canvas) {
+            const w = this.widgets.find(item => item.name === "mesh_preview");
+            if (w && pos[1] >= w.y && pos[1] <= w.y + w.height) {
+                const zoom_factor = event.deltaY < 0 ? 1.1 : 0.9;
+                this.mesh_zoom = Math.max(0.1, Math.min(10.0, (this.mesh_zoom || 1.0) * zoom_factor));
+                this.setDirtyCanvas(true, true);
+                return true;
+            }
+        };
     }
 });
 
